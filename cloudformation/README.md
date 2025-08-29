@@ -11,6 +11,10 @@ reconstruct 3D scenes, or transform your data in custom ways. Sample jobs to sub
 provides many integrated submitter plugins for applications, and you can build your own jobs. The deployed farm includes the ability to
 [build custom conda packages](../conda_recipes/README.md) for providing additional application support.
 
+## Service-managed fleet with FSx for OpenZFS
+
+The [service_managed_fleet_fsx_openzfs](service_managed_fleet_fsx_openzfs/) sample CloudFormation template demonstrates how to set up a Deadline Cloud service-managed fleet that connects to FSx for OpenZFS storage through a VPC resource endpoint.
+
 ## Budget events notification
 
 The [budget_events_notification](notification_templates/budget_events_notification/) CloudFormation template sets up an integration

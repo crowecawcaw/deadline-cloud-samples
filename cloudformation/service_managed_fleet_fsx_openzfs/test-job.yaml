@@ -1,0 +1,59 @@
+specificationVersion: 'jobtemplate-2023-09'
+name: NFS Read Write Example Job
+parameterDefinitions:
+- name: InputFile
+  type: STRING
+  default: input.txt
+- name: OutputFile
+  type: STRING
+  default: output.txt
+- name: Message
+  type: STRING
+  default: Hello from Deadline Cloud worker!
+steps:
+- name: NFSReadWriteTest
+  script:
+    actions:
+      onRun:
+        command: bash
+        args: ['{{Task.File.Run}}']
+    embeddedFiles:
+    - name: Run
+      type: TEXT
+      data: |
+        #!/bin/bash
+        set -e
+        
+        echo "Starting NFS read/write test"
+        echo "NFS mount point: /mnt/fsx"
+        
+        # Verify NFS mount
+        if ! mountpoint -q /mnt/fsx; then
+            echo "ERROR: /mnt/fsx is not mounted"
+            exit 1
+        fi
+        
+        echo "NFS mount verified"
+        ls -la /mnt/fsx
+        
+        # Write test file to NFS
+        echo "Writing to NFS: {{Param.Message}}"
+        echo "{{Param.Message}}" > /mnt/fsx/{{Param.InputFile}}
+        echo "Timestamp: $(date)" >> /mnt/fsx/{{Param.InputFile}}
+        echo "Worker: $(hostname)" >> /mnt/fsx/{{Param.InputFile}}
+        
+        # Read from NFS and process
+        echo "Reading from NFS..."
+        cat /mnt/fsx/{{Param.InputFile}}
+        
+        # Create output file
+        echo "Creating output file..."
+        echo "Processed by Deadline Cloud worker $(hostname)" > /mnt/fsx/{{Param.OutputFile}}
+        echo "Input content:" >> /mnt/fsx/{{Param.OutputFile}}
+        cat /mnt/fsx/{{Param.InputFile}} >> /mnt/fsx/{{Param.OutputFile}}
+        echo "Processing completed at: $(date)" >> /mnt/fsx/{{Param.OutputFile}}
+        
+        echo "Final NFS directory contents:"
+        ls -la /mnt/fsx/
+        
+        echo "NFS read/write test completed successfully"
