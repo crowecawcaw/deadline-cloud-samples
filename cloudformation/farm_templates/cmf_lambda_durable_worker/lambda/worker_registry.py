@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "")
 
+# How long a registry row survives if its worker never deregisters. Comfortably longer
+# than any worker should live, so expiry only ever catches abandoned rows.
+REGISTRY_TTL_SECONDS = int(os.environ.get("REGISTRY_TTL_SECONDS", str(48 * 3600)))
+
 
 @lru_cache(maxsize=1)
 def _table():
@@ -46,6 +50,10 @@ def register(*, fleet_id: str, worker_id: str, started_at: str) -> None:
                 "workerId": worker_id,
                 "startedAt": started_at,
                 "drain": False,
+                # Backstop for a worker that dies without deregistering. A stale row
+                # counts against fleet capacity, so one that is never cleaned up would
+                # quietly stop the fleet from ever scaling out again.
+                "expiresAt": _expiry_epoch(),
             }
         )
     except ClientError as exc:
@@ -76,6 +84,16 @@ def deregister(*, fleet_id: str, worker_id: str) -> None:
         _table().delete_item(Key={"fleetId": fleet_id, "workerId": worker_id})
     except ClientError as exc:
         logger.error(f"Failed to remove {worker_id} from the registry: {exc}")
+
+
+def _expiry_epoch() -> int:
+    """The Unix timestamp at which an abandoned row should expire.
+
+    Only called from inside a durable step, for the same reason as `utc_now_iso`.
+    """
+    from datetime import datetime, timezone
+
+    return int(datetime.now(timezone.utc).timestamp()) + REGISTRY_TTL_SECONDS
 
 
 def utc_now_iso() -> str:

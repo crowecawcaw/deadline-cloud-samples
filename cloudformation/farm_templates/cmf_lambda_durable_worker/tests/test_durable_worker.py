@@ -221,39 +221,42 @@ class TestThrottleHandling(unittest.TestCase):
         self.assertIn("ValidationException", result["error"])
 
 
-class TestTimestampConversion(unittest.TestCase):
-    """Timestamps cross a JSON checkpoint boundary as strings."""
+class TestTimestampSerialization(unittest.TestCase):
+    """Session action results carry timestamps as strings across a checkpoint."""
 
-    def test_iso_strings_become_datetimes(self):
-        from datetime import datetime
+    def test_botocore_accepts_iso_strings_for_timestamp_members(self):
+        import boto3
+        from botocore.stub import Stubber
 
-        converted = worker_protocol._deserialize_timestamps(
-            {
+        client = boto3.client(
+            "deadline",
+            region_name="us-west-2",
+            aws_access_key_id="a",
+            aws_secret_access_key="b",
+        )
+        stubber = Stubber(client)
+        stubber.add_response(
+            "update_worker_schedule",
+            {"assignedSessions": {}, "cancelSessionActions": {}, "updateIntervalSeconds": 15},
+        )
+        stubber.activate()
+        # Checkpoints hold JSON, so timestamps arrive as strings. This pins the reason
+        # no conversion is needed: botocore serializes ISO-8601 strings for timestamp
+        # members itself. If that ever stopped being true, this fails loudly here
+        # rather than as a ParamValidationError against a live worker.
+        client.update_worker_schedule(
+            farmId="farm-" + "0" * 32,
+            fleetId="fleet-" + "0" * 32,
+            workerId="worker-" + "0" * 32,
+            updatedSessionActions={
                 "action-1": {
                     "completedStatus": "SUCCEEDED",
                     "startedAt": "2026-01-01T00:00:00+00:00",
                     "endedAt": "2026-01-01T00:05:00+00:00",
                 }
-            }
+            },
         )
-        entry = converted["action-1"]
-        self.assertIsInstance(entry["startedAt"], datetime)
-        self.assertIsInstance(entry["endedAt"], datetime)
-        # Non-timestamp fields pass through untouched.
-        self.assertEqual(entry["completedStatus"], "SUCCEEDED")
-
-    def test_absent_timestamps_are_left_alone(self):
-        converted = worker_protocol._deserialize_timestamps(
-            {"action-1": {"completedStatus": "SUCCEEDED"}}
-        )
-        self.assertEqual(converted["action-1"], {"completedStatus": "SUCCEEDED"})
-
-    def test_input_is_not_mutated(self):
-        # The caller keeps these results for its next heartbeat, so converting must
-        # not turn the checkpointed strings into datetimes in place.
-        original = {"action-1": {"startedAt": "2026-01-01T00:00:00+00:00"}}
-        worker_protocol._deserialize_timestamps(original)
-        self.assertIsInstance(original["action-1"]["startedAt"], str)
+        stubber.assert_no_pending_responses()
 
 
 class TestWorkerCredentials(unittest.TestCase):

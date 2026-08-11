@@ -26,9 +26,20 @@ correctness requirement, so this module follows three rules:
    `CreateWorker` call cannot register a second worker on replay.
 2. Control flow depends only on step results, never on ambient state such as a
    clock read or a random value at the top level of the handler.
-3. Credentials are refreshed in their own step after every wait rather than being
-   carried across one. A replayed credential blob would likely be expired, and
-   refreshing is cheap compared to the request it protects.
+3. Timestamps are captured inside steps. `UpdateWorkerSchedule` requires `startedAt`
+   on any completed action, and a clock read outside a checkpoint would report a
+   different time on every replay.
+4. Step identity is positional. The SDK matches a checkpoint to a step by call order,
+   not by function name, so inserting a step ahead of an existing one shifts every
+   later step's identity. That is the usual way an adapted durable function breaks:
+   in-flight executions resume against a checkpoint log that no longer lines up.
+   Adding a step at the end is safe, and a retry loop that re-runs the same step must
+   vary its arguments, as `submit_bedrock_job` does with its attempt number, so each
+   attempt gets its own checkpoint instead of replaying the first result forever.
+
+Credentials are deliberately not checkpointed. They are far shorter-lived than a
+durable execution, so a replayed copy would usually be expired. `worker_protocol` wraps
+them in botocore's `RefreshableCredentials` instead and lets botocore renew them.
 """
 
 from __future__ import annotations
@@ -50,7 +61,7 @@ import bedrock_task
 import worker_registry
 from worker_protocol import (
     DeadlineWorker,
-    WorkerDeletedError,
+    WorkerNotUsableError,
     default_capabilities,
 )
 
@@ -62,9 +73,10 @@ FLEET_ID = os.environ["FLEET_ID"]
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 
 # A worker that finds no work for this many consecutive polls deletes itself. Scale-in
-# is normally driven by the service setting `desiredWorkerStatus` to STOPPED; this is a
-# backstop so an orphaned execution cannot idle for the full one-year execution
-# timeout.
+# normally drives shutdown through the drain flag; this is a backstop so an orphaned
+# execution cannot idle for the stack's whole ExecutionTimeout, which is 24 hours.
+# At the usual ~15s interval this is roughly five minutes of idle before the worker
+# gives up its capacity, which is the knob to raise for bursty jobs.
 MAX_IDLE_POLLS = int(os.environ.get("MAX_IDLE_POLLS", "20"))
 
 # Bound the loop so a wedged execution cannot run forever. Each iteration is one
@@ -111,6 +123,34 @@ def mark_action_started(step_context, session_action_id: str) -> str:
 
 
 @durable_step
+def heartbeat(step_context, worker_id: str, progress: dict[str, Any]) -> dict[str, Any]:
+    """Report progress on a running action without completing it.
+
+    A worker must keep calling `UpdateWorkerSchedule` even while busy, or the service
+    stops hearing from it and marks it NOT_RESPONDING. The real worker agent runs
+    sessions on a thread pool so its main loop can keep heartbeating; a durable
+    execution is single-threaded, so the wait loop has to heartbeat itself.
+
+    Sends the action's progress with no `completedStatus`, which tells the service the
+    action is still running. Any cancellation or shutdown request in the response is
+    returned so the caller can react.
+    """
+    worker = DeadlineWorker(
+        farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
+    )
+    try:
+        response = worker.update_worker_schedule(updated_session_actions=progress)
+    except WorkerNotUsableError:
+        step_context.logger.warning(f"Worker {worker_id} is no longer usable while working")
+        return {"workerDeleted": True, "cancelSessionActions": {}}
+    return {
+        "workerDeleted": False,
+        "desiredWorkerStatus": response.get("desiredWorkerStatus"),
+        "cancelSessionActions": response.get("cancelSessionActions", {}),
+    }
+
+
+@durable_step
 def poll_schedule(
     step_context, worker_id: str, updated_session_actions: dict[str, Any]
 ) -> dict[str, Any]:
@@ -126,8 +166,8 @@ def poll_schedule(
         response = worker.update_worker_schedule(
             updated_session_actions=updated_session_actions
         )
-    except WorkerDeletedError:
-        step_context.logger.warning(f"Worker {worker_id} was deleted by the service")
+    except WorkerNotUsableError:
+        step_context.logger.warning(f"Worker {worker_id} is no longer usable")
         return {"workerDeleted": True, "updateIntervalSeconds": 0, "assignedSessions": {}}
 
     # Check the drain flag on the same beat as the heartbeat. Scale-in for a
@@ -196,7 +236,7 @@ def deregister_worker(step_context, worker_id: str) -> dict[str, Any]:
         worker.update_worker_status(status="STOPPED")
         worker.delete_worker()
         step_context.logger.info(f"Worker {worker_id} deregistered")
-    except WorkerDeletedError:
+    except WorkerNotUsableError:
         # Already gone. Deregistration is idempotent by intent, so this is success.
         pass
     # Drop the registry row last, so this worker keeps counting toward fleet capacity
@@ -252,6 +292,7 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
             stop_reason = "scale-in-drain"
             tasks_completed += _finish_assigned_work(
                 context=context,
+                worker_id=worker_id,
                 poll=poll,
                 pending_updates=pending_updates,
             )
@@ -271,6 +312,7 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
         idle_polls = 0
         tasks_completed += _finish_assigned_work(
             context=context,
+            worker_id=worker_id,
             poll=poll,
             pending_updates=pending_updates,
         )
@@ -291,6 +333,7 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
 def _finish_assigned_work(
     *,
     context: DurableContext,
+    worker_id: str,
     poll: dict[str, Any],
     pending_updates: dict[str, Any],
 ) -> int:
@@ -303,7 +346,9 @@ def _finish_assigned_work(
     succeeded = 0
     for session in (poll.get("assignedSessions") or {}).values():
         for action in session["sessionActions"]:
-            result = _run_session_action(context=context, action=action)
+            result = _run_session_action(
+                context=context, worker_id=worker_id, action=action
+            )
             pending_updates[action["sessionActionId"]] = result
             if result.get("completedStatus") == "SUCCEEDED":
                 succeeded += 1
@@ -313,6 +358,7 @@ def _finish_assigned_work(
 def _run_session_action(
     *,
     context: DurableContext,
+    worker_id: str,
     action: dict[str, Any],
 ) -> dict[str, Any]:
     """Run one assigned session action and return its result for the next heartbeat.
@@ -367,10 +413,43 @@ def _run_session_action(
 
     # Wait out the generation. Each iteration suspends the execution, so a request
     # that takes ten minutes costs compute only for the brief polls, not the wait.
+    # Every iteration also heartbeats: without that the service stops hearing from the
+    # worker for the whole generation and marks it NOT_RESPONDING.
     last_observed_at = submission.get("submittedAt", started_at)
     for _ in range(bedrock_task.MAX_GENERATION_POLLS):
         context.wait(Duration.from_seconds(bedrock_task.GENERATION_POLL_SECONDS))
         status = context.step(check_bedrock_job(submission["invocationArn"]))
+
+        beat = context.step(
+            heartbeat(
+                worker_id,
+                {
+                    session_action_id: {
+                        "startedAt": started_at,
+                        "updatedAt": status["observedAt"],
+                        "progressMessage": f"Generation {status['status']}"[:4096],
+                    }
+                },
+            )
+        )
+        if beat["workerDeleted"]:
+            # The worker no longer exists, so no result can be reported for this
+            # action. Abandon it and let the loop shut the worker down.
+            return {
+                "completedStatus": "INTERRUPTED",
+                "startedAt": started_at,
+                "endedAt": status["observedAt"],
+                "progressMessage": "Worker was deleted while the request was running",
+            }
+        if session_action_id in beat.get("cancelSessionActions", {}):
+            # The service withdrew this action. Stop polling and report it as canceled
+            # rather than finishing work nobody is waiting for.
+            return {
+                "completedStatus": "CANCELED",
+                "startedAt": started_at,
+                "endedAt": status["observedAt"],
+                "progressMessage": "Canceled by the service while generating",
+            }
 
         if status["status"] == "Completed":
             return {

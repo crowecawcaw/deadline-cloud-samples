@@ -66,6 +66,13 @@ Resources:
             Action:
               - sts:AssumeRole
               - sts:TagSession
+            # Guards against the confused deputy problem: without these the role could
+            # be assumed on behalf of a farm in someone else's account.
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}
       ManagedPolicyArns:
         # Grants the Deadline Cloud worker actions: UpdateWorker,
         # UpdateWorkerSchedule, BatchGetJobEntity, and the role assumptions.
@@ -172,6 +179,12 @@ Resources:
           KeyType: RANGE
       SSESpecification:
         SSEEnabled: true
+      # A worker deletes its own row when it stops. This expiry is the backstop: if an
+      # execution dies without deregistering, its row would otherwise count against
+      # fleet capacity forever and quietly prevent any further scale-out.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
 
   # -- Durable worker function -------------------------------------------------
 
@@ -208,18 +221,20 @@ Resources:
               # StartAsyncInvoke additionally requires bedrock:InvokeModel: the
               # async-invoke call is authorized as a model invocation, and without
               # InvokeModel it fails with AccessDenied on the async-invoke resource.
-              # Both the model and the async-invoke resource must be covered, so this
-              # is left unscoped rather than naming one ARN.
+              # Both resources are named so this grant does not extend to other Bedrock
+              # usage in the account.
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
                   - bedrock:StartAsyncInvoke
                   - bedrock:GetAsyncInvoke
-                Resource: '*'
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*
+                  - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
+              # Write only: Bedrock writes the generated output using these credentials,
+              # and nothing in this sample reads it back.
               - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetObject
+                Action: s3:PutObject
                 Resource: !Sub ${OutputBucket.Arn}/*
               - Effect: Allow
                 Action:
@@ -319,7 +334,9 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Description: Starts and drains durable workers from Deadline Cloud scaling events.
-      Runtime: python3.13
+      # Same runtime as the worker: both functions deploy from the same package, which
+      # is built for one Python version.
+      Runtime: python3.14
       # Both functions deploy from the same package; each uses its own module.
       Handler: scaling_handler.lambda_handler
       Role: !GetAtt ScalingFunctionRole.Arn

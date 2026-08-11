@@ -8,33 +8,12 @@ name: Bedrock Generation Fanout
 # The step has no script: a durable Lambda worker reads the task parameters and makes
 # the API call itself rather than running a command on a host. The `hostRequirements`
 # block below is what keeps these tasks on that kind of worker.
-
-parameterDefinitions:
-- name: ModelId
-  type: STRING
-  userInterface:
-    control: LINE_EDIT
-    label: Model ID
-  description: >
-    Bedrock model to invoke. Must support asynchronous invocation, which the video
-    generation models do; image models such as Nova Canvas are synchronous only.
-  default: luma.ray-v2:0
-- name: Duration
-  type: STRING
-  userInterface:
-    control: DROPDOWN_LIST
-    label: Clip Duration
-  description: Length of each generated clip.
-  allowedValues: ["5s", "9s"]
-  default: "5s"
-- name: Resolution
-  type: STRING
-  userInterface:
-    control: DROPDOWN_LIST
-    label: Resolution
-  description: Output resolution. Higher resolutions take longer to generate.
-  allowedValues: ["540p", "720p", "1080p"]
-  default: "540p"
+#
+# Everything the request needs is a TASK parameter, not a job parameter. A worker
+# receives task parameters directly in the `taskRun` session action, whereas job
+# parameters have to be fetched with `BatchGetJobEntity`, which this sample
+# deliberately does not implement. A job parameter here would silently never reach the
+# worker, which is worth knowing before adding one.
 
 steps:
 - name: Generate
@@ -50,6 +29,21 @@ steps:
       - "a red sports car driving along a coastal highway at sunset, cinematic"
       - "a slow aerial push over a misty pine forest at dawn"
       - "timelapse of storm clouds gathering over a desert mesa"
+    # Single-valued ranges: these are settings rather than things to fan out over, so
+    # every task gets the same value. Combined with the prompts above they would form a
+    # cross product, so they must stay single-valued to keep one task per prompt.
+    - name: ModelId
+      type: STRING
+      # Must support asynchronous invocation, which the video generation models do;
+      # image models such as Nova Canvas are synchronous only and cannot be polled.
+      range: ["luma.ray-v2:0"]
+    - name: Duration
+      type: STRING
+      range: ["5s"]
+    - name: Resolution
+      type: STRING
+      # Higher resolutions take longer to generate, which the worker sleeps through.
+      range: ["540p"]
   hostRequirements:
     attributes:
       # Restrict these tasks to the durable Lambda workers. Those workers report this
@@ -70,7 +64,7 @@ steps:
     - name: Report
       type: TEXT
       data: |
-        echo "Requested {{Param.ModelId}} generation"
+        echo "Requested {{Task.Param.ModelId}} generation"
         echo "  prompt:     {{Task.Param.Prompt}}"
-        echo "  duration:   {{Param.Duration}}"
-        echo "  resolution: {{Param.Resolution}}"
+        echo "  duration:   {{Task.Param.Duration}}"
+        echo "  resolution: {{Task.Param.Resolution}}"

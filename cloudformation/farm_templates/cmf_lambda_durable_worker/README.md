@@ -47,14 +47,18 @@ underneath it, and the external service's charges are unaffected either way.
 
 Three workers generating three clips, from the run used to validate this sample:
 
-* combined worker lifetime: **665 seconds**
-* suspended in durable waits: **614 seconds (92%)**
-* billed Lambda compute: **51 seconds** across 24 invocations, or **8%** of lifetime
+* combined worker lifetime: **755 seconds**
+* suspended in durable waits: **688 seconds (91%)**
+* billed Lambda compute: **67 seconds** across 26 invocations, or **9%** of lifetime
 
-At 512 MB in `us-west-2` that is about 25.6 GB-seconds, so roughly **$0.0004** in Lambda
-charges for the whole run, or about **$0.014 per 100 clips**. Compute is not the
+At 512 MB in `us-west-2` that is about 33 GB-seconds, so roughly **$0.0006** in Lambda
+charges for the whole run, or about **$0.02 per 100 clips**. Compute is not the
 interesting line item at this scale, which is the point: the same three clips on a
-conventional worker would have billed an instance for all 665 seconds while it waited.
+conventional worker would have billed an instance for all 755 seconds while it waited.
+
+Part of that 9% is the price of staying correct. A busy worker has to keep heartbeating,
+so each generation poll also calls `UpdateWorkerSchedule`; skipping those heartbeats
+looks cheaper and gets the worker marked `NOT_RESPONDING` with its task reassigned.
 
 Two caveats keep this honest. Bedrock generation dominates the total bill by orders of
 magnitude, so this pattern optimizes the smaller half of the cost. And the saving only
@@ -64,7 +68,7 @@ and the instance is likely cheaper.
 
 ### Two ways to lose the saving
 
-Reaching 8% took two fixes, both worth knowing if you adapt this sample, because both
+Reaching 9% took two fixes, both worth knowing if you adapt this sample, because both
 quietly turn waiting back into billed compute:
 
 * **Do not let botocore retry in process.** Its backoff sleeps inside the API call, and
@@ -105,6 +109,21 @@ the request for work), act on whatever comes back, and sleep for the interval th
 service asks for. When it receives a task it starts a Bedrock request, sleeps between
 status checks, and reports the result on its next heartbeat.
 
+### Heartbeating while busy
+
+A worker must keep calling `UpdateWorkerSchedule` even while it is working. Stop, and the
+service concludes the worker is gone: it marks it `NOT_RESPONDING` and reassigns the
+task, so a second worker starts the same Bedrock request while the first is still
+running it, and the first worker's eventual result is rejected.
+
+This is easy to get wrong here. The real worker agent runs sessions on a thread pool so
+its main loop can keep heartbeating independently, but a durable execution is
+single-threaded: a wait for a ten-minute Bedrock request is a wait for everything. So the
+generation loop heartbeats on every poll, sending the action's progress with **no**
+`completedStatus`, which is how the protocol expresses "still running". That is also
+where the worker learns the service has cancelled the action, in which case it stops
+polling and reports `CANCELED` instead of paying for a result nobody is waiting for.
+
 ### Why not use the worker agent
 
 The [`deadline-cloud-worker-agent`](https://github.com/aws-deadline/deadline-cloud-worker-agent)
@@ -118,6 +137,15 @@ replays. This sample implements only the five calls a worker actually needs —
 The tradeoff is real: you give up job attachments, session log streaming, host
 configuration scripts, and running jobs as a specific user. That is why the job template
 here describes an API call rather than a command to execute.
+
+Two consequences deserve to be stated plainly, because both fail quietly rather than
+loudly. **Queue environments are not run.** Deadline Cloud assigns `envEnter` and
+`envExit` actions around a task, and this worker acknowledges them as succeeded without
+doing anything, because it has no local session to prepare. That is safe only while the
+task needs nothing from the environment, which holds here since the task is an API call.
+Attach a Conda queue environment to this queue and it becomes a silent no-op. **Job
+parameters do not reach the worker**, only task parameters do; job-level parameters
+require `BatchGetJobEntity`, which this sample does not implement.
 
 ### Writing for replay
 
@@ -237,10 +265,14 @@ the worker was suspended and unbilled.
 | `ModelId` | `luma.ray-v2:0` | Async-capable Bedrock model to invoke |
 | `GenerationPollSeconds` | `30` | Sleep between checks on an in-flight request |
 
-Two further settings are read from the environment rather than exposed as stack
-parameters: `SUBMIT_RETRY_SECONDS` (default 60) and `MAX_SUBMIT_ATTEMPTS` (default 10)
-control how long and how many times a throttled submit waits before retrying. Raising
-the interval costs nothing, since the wait is suspended.
+Several further limits are code defaults rather than stack parameters, so changing them
+means editing the template's `Environment` block: `SUBMIT_RETRY_SECONDS` (60) and
+`MAX_SUBMIT_ATTEMPTS` (10) bound how long a throttled submit waits before retrying;
+`MAX_GENERATION_POLLS` (120) bounds how long a request may run; `MAX_IDLE_POLLS` (20,
+about five minutes) is how long an idle worker waits before deleting itself, which is
+the one to raise for bursty jobs; and `REGISTRY_TTL_SECONDS` (48 hours) expires the
+registry row of a worker that died without deregistering. Raising any of the wait
+intervals costs nothing, because the waits are suspended.
 
 Stack outputs give the `FleetId`, the worker function alias ARN, the scaling function
 name, the output bucket, and the registry table. Generated files land in

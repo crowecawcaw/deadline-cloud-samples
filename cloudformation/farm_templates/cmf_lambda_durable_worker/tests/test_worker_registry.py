@@ -58,6 +58,11 @@ class TestRegister(unittest.TestCase):
         # drain is written explicitly rather than left absent, so the attribute exists
         # from the moment the worker is visible to a scaling event.
         self.assertIs(item["drain"], False)
+        # An abandoned row counts against fleet capacity forever and would quietly stop
+        # the fleet from scaling out, so every row carries a DynamoDB TTL as a backstop.
+        self.assertIn("expiresAt", item)
+        self.assertIsInstance(item["expiresAt"], int)
+        self.assertGreater(item["expiresAt"], 0)
 
     def test_a_write_failure_does_not_reach_the_caller(self):
         # register() runs inside the same durable step as CreateWorker and the STARTED

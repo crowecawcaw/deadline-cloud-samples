@@ -171,6 +171,16 @@ class _WorkerLoopTestCase(unittest.TestCase):
                 "observedAt": "2026-01-01T00:05:00+00:00",
             },
         ), mock.patch.object(
+            # A busy worker heartbeats from inside the generation wait loop. Nothing is
+            # cancelled or deleted in these tests, so the quiet response is the default.
+            durable_worker,
+            "heartbeat",
+            lambda worker_id, progress: {
+                "workerDeleted": False,
+                "desiredWorkerStatus": None,
+                "cancelSessionActions": {},
+            },
+        ), mock.patch.object(
             durable_worker, "MAX_IDLE_POLLS", max_idle_polls
         ):
             result = durable_worker.lambda_handler({"hostName": "test-host"}, context)
@@ -338,9 +348,19 @@ class TestSubmitThrottleRetry(unittest.TestCase):
                 "outputUri": "s3://b/o/",
                 "observedAt": "T2",
             },
+        ), mock.patch.object(
+            durable_worker,
+            "heartbeat",
+            lambda worker_id, progress: {
+                "workerDeleted": False,
+                "desiredWorkerStatus": None,
+                "cancelSessionActions": {},
+            },
         ):
             action = _task_run_session()["session-1"]["sessionActions"][0]
-            result = durable_worker._run_session_action(context=context, action=action)
+            result = durable_worker._run_session_action(
+                context=context, worker_id=WORKER_ID, action=action
+            )
         return result, attempts, context.waits
 
     def test_a_throttled_submit_is_retried_after_a_wait(self):
@@ -371,6 +391,102 @@ class TestSubmitThrottleRetry(unittest.TestCase):
         self.assertEqual(attempts, [0])
         self.assertEqual(waits, [])
         self.assertIn("bad prompt", result["progressMessage"])
+
+
+class TestHeartbeatWhileWorking(unittest.TestCase):
+    """A busy worker must keep heartbeating or the service declares it dead.
+
+    The real worker agent runs sessions on a thread pool so its main loop can keep
+    calling UpdateWorkerSchedule. A durable execution is single-threaded, so the
+    generation wait loop has to heartbeat itself; without that the worker goes silent
+    for the whole request and the service marks it NOT_RESPONDING.
+    """
+
+    def _run(self, *, statuses, heartbeat_results=None):
+        beats = []
+
+        def fake_heartbeat(worker_id, progress):
+            beats.append(progress)
+            if heartbeat_results:
+                return heartbeat_results[min(len(beats) - 1, len(heartbeat_results) - 1)]
+            return {
+                "workerDeleted": False,
+                "desiredWorkerStatus": None,
+                "cancelSessionActions": {},
+            }
+
+        checks = []
+
+        def fake_check(invocation_arn):
+            result = statuses[min(len(checks), len(statuses) - 1)]
+            checks.append(result)
+            return result
+
+        context = FakeDurableContext()
+        with mock.patch.object(
+            durable_worker, "mark_action_started", lambda session_action_id: "T0"
+        ), mock.patch.object(
+            durable_worker,
+            "submit_bedrock_job",
+            lambda task_parameters, attempt=0: {
+                "invocationArn": "arn:aws:bedrock:us-west-2:123456789012:async-invoke/a",
+                "submittedAt": "T1",
+            },
+        ), mock.patch.object(
+            durable_worker, "check_bedrock_job", fake_check
+        ), mock.patch.object(
+            durable_worker, "heartbeat", fake_heartbeat
+        ):
+            action = _task_run_session()["session-1"]["sessionActions"][0]
+            result = durable_worker._run_session_action(
+                context=context, worker_id=WORKER_ID, action=action
+            )
+        return result, beats
+
+    def test_every_generation_poll_also_heartbeats(self):
+        in_progress = {"status": "InProgress", "observedAt": "T2"}
+        done = {"status": "Completed", "outputUri": "s3://b/o/", "observedAt": "T3"}
+        result, beats = self._run(statuses=[in_progress, in_progress, done])
+
+        self.assertEqual(result["completedStatus"], "SUCCEEDED")
+        # One heartbeat per poll, including the polls where nothing had finished yet.
+        self.assertEqual(len(beats), 3)
+
+    def test_the_heartbeat_reports_progress_without_completing_the_action(self):
+        _, beats = self._run(
+            statuses=[{"status": "Completed", "outputUri": "s3://b/o/", "observedAt": "T3"}]
+        )
+        progress = beats[0]["sessionaction-1"]
+        # No completedStatus: that is what marks the action still running. Sending one
+        # here would complete the action while the request was still in flight.
+        self.assertNotIn("completedStatus", progress)
+        self.assertEqual(progress["startedAt"], "T0")
+        self.assertIn("updatedAt", progress)
+
+    def test_a_cancelled_action_stops_polling_and_reports_canceled(self):
+        cancelled = {
+            "workerDeleted": False,
+            "desiredWorkerStatus": None,
+            "cancelSessionActions": {"sessionaction-1": ["sessionaction-1"]},
+        }
+        result, beats = self._run(
+            statuses=[{"status": "InProgress", "observedAt": "T2"}],
+            heartbeat_results=[cancelled],
+        )
+        # Finishing work the service has withdrawn wastes Bedrock spend and reports a
+        # result nobody is waiting for.
+        self.assertEqual(result["completedStatus"], "CANCELED")
+        self.assertEqual(len(beats), 1)
+
+    def test_a_deleted_worker_abandons_the_action(self):
+        deleted = {"workerDeleted": True, "cancelSessionActions": {}}
+        result, _ = self._run(
+            statuses=[{"status": "InProgress", "observedAt": "T2"}],
+            heartbeat_results=[deleted],
+        )
+        # No worker means no way to report a result, so the action is interrupted
+        # rather than reported as succeeded or failed.
+        self.assertEqual(result["completedStatus"], "INTERRUPTED")
 
 
 if __name__ == "__main__":

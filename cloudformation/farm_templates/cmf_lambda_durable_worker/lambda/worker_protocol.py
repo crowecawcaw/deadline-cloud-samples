@@ -50,7 +50,19 @@ class WorkerProtocolError(Exception):
     """A worker protocol call failed in a way the caller cannot recover from."""
 
 
-class WorkerDeletedError(WorkerProtocolError):
+class WorkerNotUsableError(WorkerProtocolError):
+    """This worker can no longer do work, whatever the reason.
+
+    Raised for both a deleted worker and one the service has taken out of STARTED,
+    which is what a ConflictException on UpdateWorkerSchedule means. Both have the same
+    remedy, which is to stop cleanly and deregister rather than keep polling, so the
+    caller does not benefit from telling them apart. Treating a conflict as an
+    unhandled error instead would fail the execution before it deregistered, leaving a
+    registry row that counts against fleet capacity forever.
+    """
+
+
+class WorkerDeletedError(WorkerNotUsableError):
     """The service no longer recognizes this worker.
 
     Deadline Cloud deletes workers that stop heartbeating. A durable execution that
@@ -241,12 +253,19 @@ class DeadlineWorker:
                 farmId=self.farm_id,
                 fleetId=self.fleet_id,
                 workerId=self.worker_id,
-                updatedSessionActions=_deserialize_timestamps(
-                    updated_session_actions or {}
-                ),
+                # Timestamps are passed as ISO-8601 strings. botocore accepts those for
+                # timestamp members and serializes them itself, so results can cross a
+                # JSON checkpoint boundary without conversion here.
+                updatedSessionActions=updated_session_actions or {},
             )
         except client.exceptions.ResourceNotFoundException as exc:
             raise WorkerDeletedError(f"Worker {self.worker_id} no longer exists") from exc
+        except client.exceptions.ConflictException as exc:
+            # The worker is no longer STARTED, usually because it stopped heartbeating
+            # for long enough that the service took it out of service.
+            raise WorkerNotUsableError(
+                f"Worker {self.worker_id} is no longer in the STARTED status"
+            ) from exc
 
     def delete_worker(self) -> None:
         """Deregister the worker. Safe to call when the worker is already gone."""
@@ -267,29 +286,6 @@ def _as_iso(expiration: Any) -> str:
     from JSON will have a string. Accept either.
     """
     return expiration if isinstance(expiration, str) else expiration.isoformat()
-
-
-def _deserialize_timestamps(
-    updated_session_actions: dict[str, Any],
-) -> dict[str, Any]:
-    """Convert ISO-8601 timestamp strings back into datetime objects for botocore.
-
-    Session action results travel through durable checkpoints, which hold JSON, so
-    timestamps are carried as strings. The Deadline Cloud API models `startedAt` and
-    `endedAt` as timestamps, and botocore will not serialize a bare string for a
-    timestamp member, so they are converted back here at the boundary.
-    """
-    from datetime import datetime
-
-    converted: dict[str, Any] = {}
-    for action_id, update in updated_session_actions.items():
-        entry = dict(update)
-        for field in ("startedAt", "endedAt", "updatedAt"):
-            value = entry.get(field)
-            if isinstance(value, str):
-                entry[field] = datetime.fromisoformat(value)
-        converted[action_id] = entry
-    return converted
 
 
 def default_capabilities() -> dict[str, Any]:

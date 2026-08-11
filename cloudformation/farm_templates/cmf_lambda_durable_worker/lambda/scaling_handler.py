@@ -139,8 +139,12 @@ def _scale_out(*, fleet_id: str, count: int) -> int:
     """Start `count` new durable worker executions."""
     started = 0
     for _ in range(count):
-        # A unique execution name makes the start idempotent: an EventBridge retry
-        # that redelivers the same event cannot double-start this worker.
+        # A random name is deliberately NOT idempotent: a redelivered event starts
+        # another worker. Deriving the name from the event id would make retries
+        # idempotent, but then a genuine second scale-out for the same recommendation
+        # could not start a worker either. Over-starting is bounded by the headroom
+        # check above and self-corrects when idle workers time out, so the simpler
+        # random name is the better trade here.
         execution_name = f"worker-{uuid.uuid4().hex[:16]}"
         try:
             lambda_client.invoke(
