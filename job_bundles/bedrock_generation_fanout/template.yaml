@@ -1,0 +1,76 @@
+specificationVersion: 'jobtemplate-2023-09'
+name: Bedrock Generation Fanout
+
+# Each task describes one asynchronous Amazon Bedrock generation request. The durable
+# Lambda workers in the customer-managed fleet pick these up, submit the request, and
+# suspend until it finishes.
+#
+# The step has no script: a durable Lambda worker reads the task parameters and makes
+# the API call itself rather than running a command on a host. The `hostRequirements`
+# block below is what keeps these tasks on that kind of worker.
+
+parameterDefinitions:
+- name: ModelId
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Model ID
+  description: >
+    Bedrock model to invoke. Must support asynchronous invocation, which the video
+    generation models do; image models such as Nova Canvas are synchronous only.
+  default: luma.ray-v2:0
+- name: Duration
+  type: STRING
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Clip Duration
+  description: Length of each generated clip.
+  allowedValues: ["5s", "9s"]
+  default: "5s"
+- name: Resolution
+  type: STRING
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Resolution
+  description: Output resolution. Higher resolutions take longer to generate.
+  allowedValues: ["540p", "720p", "1080p"]
+  default: "540p"
+
+steps:
+- name: Generate
+  parameterSpace:
+    taskParameterDefinitions:
+    # One task per prompt. Edit this list, or override it in parameter_values.yaml,
+    # to change how many concurrent requests the fleet is asked to make. The fleet
+    # size recommendation follows the number of queued tasks, so a longer list is
+    # what drives scale-out.
+    - name: Prompt
+      type: STRING
+      range:
+      - "a red sports car driving along a coastal highway at sunset, cinematic"
+      - "a slow aerial push over a misty pine forest at dawn"
+      - "timelapse of storm clouds gathering over a desert mesa"
+  hostRequirements:
+    attributes:
+      # Restrict these tasks to the durable Lambda workers. Those workers report this
+      # attribute in their capabilities, so a conventional worker in another fleet will
+      # not be assigned a step it has no way to run.
+      - name: attr.durable.lambda
+        anyOf: ["true"]
+  script:
+    actions:
+      onRun:
+        # A durable Lambda worker never executes this command; it inspects the task
+        # parameters instead. The action is still required by the specification, and
+        # keeping it meaningful means the same job can be run on a normal worker for
+        # comparison, or checked with "openjd run".
+        command: bash
+        args: ["{{Task.File.Report}}"]
+    embeddedFiles:
+    - name: Report
+      type: TEXT
+      data: |
+        echo "Requested {{Param.ModelId}} generation"
+        echo "  prompt:     {{Task.Param.Prompt}}"
+        echo "  duration:   {{Param.Duration}}"
+        echo "  resolution: {{Param.Resolution}}"

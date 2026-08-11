@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  A Deadline Cloud customer-managed fleet whose workers are Lambda durable functions.
+  Workers register with the fleet, heartbeat, dispatch Amazon Bedrock generation
+  requests, and suspend without compute charges while those requests run.
+
+Parameters:
+  FarmId:
+    Type: String
+    Description: ID of the Deadline Cloud farm to create the fleet in.
+    AllowedPattern: ^farm-[0-9a-f]{32}$
+    ConstraintDescription: must be a farm ID, such as farm-1234567890abcdef1234567890abcdef
+  FleetName:
+    Type: String
+    Default: DurableLambdaFleet
+    Description: Display name for the customer-managed fleet.
+  MaxWorkerCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 50
+    Description: >-
+      Maximum concurrent durable worker executions. Also caps the fleet's worker count,
+      so raising it raises both the Bedrock request concurrency and the cost ceiling.
+  ModelId:
+    Type: String
+    Default: luma.ray-v2:0
+    Description: >-
+      Bedrock model to invoke asynchronously. Must support StartAsyncInvoke, which is
+      the video generation models; image models such as Nova Canvas are synchronous
+      only and cannot be polled. Confirm availability in your Region with
+      "aws bedrock list-foundation-models".
+  GenerationPollSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 900
+    Description: >-
+      Seconds a worker sleeps between checks on an in-flight Bedrock request. The
+      execution is suspended for this whole interval, so a longer value costs nothing
+      and only delays noticing completion.
+  LambdaCodeBucket:
+    Type: String
+    Description: >-
+      S3 bucket holding the packaged Lambda source. Use deploy.sh, which builds the
+      package, uploads it, and passes this value.
+  LambdaCodeKey:
+    Type: String
+    Description: >-
+      S3 key of the packaged Lambda source. The key changes with the package contents
+      so that each deploy publishes a new function version.
+
+Resources:
+  # -- Fleet -------------------------------------------------------------------
+
+  FleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role assumed by durable Lambda workers via AssumeFleetRoleForWorker.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: credentials.deadline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        # Grants the Deadline Cloud worker actions: UpdateWorker,
+        # UpdateWorkerSchedule, BatchGetJobEntity, and the role assumptions.
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSDeadlineCloud-FleetWorker
+      Policies:
+        - PolicyName: WorkerSessionLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # Deadline Cloud creates a log stream for the worker as part of the
+              # transition to STARTED, using these credentials. The managed policy
+              # above covers only the deadline: actions, so without this the
+              # UpdateWorker call fails with "User does not have sufficient access
+              # to perform CreateLogStream" and the worker never leaves CREATED.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/deadline/*:*
+              # A worker deregisters itself when it drains. The managed fleet-worker
+              # policy covers UpdateWorker but not DeleteWorker, so without this a
+              # drained worker would linger in the fleet and keep occupying capacity
+              # against maxWorkerCount until the service timed it out.
+              #
+              # Scoped to any fleet in this farm rather than to this fleet's ID:
+              # the fleet resource takes this role's ARN as a property, so naming the
+              # fleet here would make the two resources depend on each other. The
+              # trust policy already restricts this role to Deadline Cloud, which
+              # hands it only to workers it has created.
+              - Effect: Allow
+                Action: deadline:DeleteWorker
+                Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
+
+  DurableFleet:
+    Type: AWS::Deadline::Fleet
+    Properties:
+      FarmId: !Ref FarmId
+      DisplayName: !Ref FleetName
+      Description: Workers run as Lambda durable functions and dispatch Bedrock requests.
+      RoleArn: !GetAtt FleetRole.Arn
+      MinWorkerCount: 0
+      MaxWorkerCount: !Ref MaxWorkerCount
+      Configuration:
+        CustomerManaged:
+          # Emits "Fleet Size Recommendation Change" events instead of managing
+          # capacity directly. The scaling function below consumes them.
+          Mode: EVENT_BASED_AUTO_SCALING
+          WorkerCapabilities:
+            CpuArchitectureType: x86_64
+            OsFamily: LINUX
+            VCpuCount:
+              Min: 1
+              Max: 2
+            MemoryMiB:
+              Min: 512
+              Max: 4096
+            CustomAttributes:
+              # The fleet must declare this attribute for the scheduler to consider
+              # the fleet a candidate for steps that require it. Without it, a job
+              # using the matching `hostRequirements` is reported NOT_COMPATIBLE
+              # before any worker is ever asked to run it. The workers report the
+              # same attribute in their own capabilities.
+              - Name: attr.durable.lambda
+                Values:
+                  - "true"
+
+  # -- Supporting state and storage --------------------------------------------
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    # Retained so generated output outlives the stack. Delete it manually when done.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireGeneratedOutput
+            Status: Enabled
+            Prefix: generated/
+            ExpirationInDays: 7
+
+  WorkerRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fleetId
+          AttributeType: S
+        - AttributeName: workerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fleetId
+          KeyType: HASH
+        - AttributeName: workerId
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  # -- Durable worker function -------------------------------------------------
+
+  WorkerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Grants lambda:CheckpointDurableExecution and lambda:GetDurableExecutionState,
+        # which the durable execution SDK needs to persist and replay progress.
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicDurableExecutionRolePolicy
+      Policies:
+        - PolicyName: DurableWorkerPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # The only Deadline Cloud calls a worker makes with its execution role.
+              # Everything after registration uses the fleet role obtained here.
+              #
+              # Both actions authorize against the worker resource rather than the
+              # fleet, so the ARN ends in `/worker/*`. Scoping to the fleet ARN
+              # instead is rejected with AccessDenied at CreateWorker.
+              - Effect: Allow
+                Action:
+                  - deadline:CreateWorker
+                  - deadline:AssumeFleetRoleForWorker
+                Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/${DurableFleet.FleetId}/worker/*
+              # StartAsyncInvoke additionally requires bedrock:InvokeModel: the
+              # async-invoke call is authorized as a model invocation, and without
+              # InvokeModel it fails with AccessDenied on the async-invoke resource.
+              # Both the model and the async-invoke resource must be covered, so this
+              # is left unscoped rather than naming one ARN.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:StartAsyncInvoke
+                  - bedrock:GetAsyncInvoke
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub ${OutputBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt WorkerRegistryTable.Arn
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: A Deadline Cloud worker that runs as a durable execution.
+      Runtime: python3.14
+      Handler: durable_worker.lambda_handler
+      Role: !GetAtt WorkerFunctionRole.Arn
+      # Per-invocation timeout. A durable execution spans many invocations, so this
+      # bounds one wake-up, not the worker's lifetime.
+      Timeout: 300
+      MemorySize: 512
+      DurableConfig:
+        # Total lifetime of one worker execution. Can only be set at creation:
+        # durable execution cannot be enabled on an existing function.
+        ExecutionTimeout: 86400
+        RetentionPeriodInDays: 7
+      Environment:
+        Variables:
+          FARM_ID: !Ref FarmId
+          FLEET_ID: !GetAtt DurableFleet.FleetId
+          OUTPUT_BUCKET: !Ref OutputBucket
+          REGISTRY_TABLE: !Ref WorkerRegistryTable
+          MODEL_ID: !Ref ModelId
+          GENERATION_POLL_SECONDS: !Ref GenerationPollSeconds
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+
+  # Durable functions must be invoked through a qualified ARN so that an execution
+  # stays pinned to the code version it started on, keeping replay deterministic.
+  WorkerFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref WorkerFunction
+      # Naming the package key here makes the version resource change whenever the
+      # code does, so CloudFormation publishes a new version instead of reusing a
+      # stale one. In-flight executions stay pinned to the version they started on.
+      Description: !Sub Durable worker for package ${LambdaCodeKey}
+
+  WorkerFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref WorkerFunction
+      FunctionVersion: !GetAtt WorkerFunctionVersion.Version
+      Name: live
+
+  WorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WorkerFunction}
+      RetentionInDays: 7
+
+  # -- Scaling function --------------------------------------------------------
+
+  ScalingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScalingPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref WorkerFunctionAlias
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt WorkerRegistryTable.Arn
+              # Used to check the fleet's real worker count before scaling out, so a
+              # stale registry cannot push the fleet past its maxWorkerCount.
+              # Like CreateWorker, this authorizes against the worker resource, so the
+              # ARN ends in `/worker/*` rather than naming the fleet.
+              - Effect: Allow
+                Action: deadline:ListWorkers
+                Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/${DurableFleet.FleetId}/worker/*
+
+  ScalingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Starts and drains durable workers from Deadline Cloud scaling events.
+      Runtime: python3.13
+      # Both functions deploy from the same package; each uses its own module.
+      Handler: scaling_handler.lambda_handler
+      Role: !GetAtt ScalingFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          WORKER_FUNCTION_ARN: !Ref WorkerFunctionAlias
+          REGISTRY_TABLE: !Ref WorkerRegistryTable
+          MAX_WORKERS: !Ref MaxWorkerCount
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+
+  ScalingFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ScalingFunction}
+      RetentionInDays: 7
+
+  ScalingEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Route this fleet's size recommendations to the scaling function.
+      EventPattern:
+        source:
+          - aws.deadline
+        detail-type:
+          - Fleet Size Recommendation Change
+        detail:
+          # Scope to this fleet so the rule ignores other fleets in the account.
+          fleetId:
+            - !GetAtt DurableFleet.FleetId
+      State: ENABLED
+      Targets:
+        - Id: ScalingFunctionTarget
+          Arn: !GetAtt ScalingFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+          DeadLetterConfig:
+            Arn: !GetAtt UnprocessedScalingEventQueue.Arn
+
+  ScalingEventRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ScalingFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScalingEventRule.Arn
+
+  UnprocessedScalingEventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  UnprocessedScalingEventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref UnprocessedScalingEventQueue
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt UnprocessedScalingEventQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ScalingEventRule.Arn
+
+Outputs:
+  FleetId:
+    Description: ID of the customer-managed fleet.
+    Value: !GetAtt DurableFleet.FleetId
+  WorkerFunctionAliasArn:
+    Description: Qualified ARN used to start durable worker executions.
+    Value: !Ref WorkerFunctionAlias
+  ScalingFunctionName:
+    Description: Function that consumes fleet size recommendation events.
+    Value: !Ref ScalingFunction
+  OutputBucketName:
+    Description: Bucket that Bedrock writes generated output to. Retained on stack delete.
+    Value: !Ref OutputBucket
+  WorkerRegistryTableName:
+    Description: Registry of live durable workers.
+    Value: !Ref WorkerRegistryTable
