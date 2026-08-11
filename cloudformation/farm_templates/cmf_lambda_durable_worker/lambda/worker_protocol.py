@@ -29,9 +29,13 @@ from botocore.config import Config
 
 logger = logging.getLogger(__name__)
 
-# The worker agent uses adaptive retries against Deadline Cloud so that a fleet
-# reconnecting after an outage backs off instead of stampeding the service.
-DEADLINE_BOTOCORE_CONFIG = Config(retries={"max_attempts": 5, "mode": "adaptive"})
+# The worker agent uses adaptive retries with several attempts, because on a host the
+# time it spends backing off is free. In Lambda that sleep is billed compute, so the
+# attempt count is kept low and long backoff is left to the durable step, which
+# suspends the execution between attempts at no cost. A couple of quick in-process
+# retries are still worth having: they absorb a transient blip without paying for a
+# whole replay of the step.
+DEADLINE_BOTOCORE_CONFIG = Config(retries={"max_attempts": 2, "mode": "standard"})
 
 
 class WorkerProtocolError(Exception):

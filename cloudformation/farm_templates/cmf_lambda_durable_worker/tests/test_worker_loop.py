@@ -155,7 +155,9 @@ class _WorkerLoopTestCase(unittest.TestCase):
         ), mock.patch.object(
             durable_worker,
             "submit_bedrock_job",
-            lambda task_parameters: {
+            # Accepts the retry attempt number: each submit retry is a distinct step,
+            # so the attempt is part of the step's arguments.
+            lambda task_parameters, attempt=0: {
                 "invocationArn": "arn:aws:bedrock:us-west-2:123456789012:async-invoke/abc",
                 "outputUri": "s3://test-bucket/generated/task-1/",
                 "submittedAt": "2026-01-01T00:00:01+00:00",
@@ -304,6 +306,71 @@ class TestProgressReporting(_WorkerLoopTestCase):
         )
         self.assertIn("sessionaction-1", poll_calls[1]["updates"])
         self.assertEqual(poll_calls[2]["updates"], {})
+
+
+class TestSubmitThrottleRetry(unittest.TestCase):
+    """A throttled submit retries behind a durable wait rather than failing the task.
+
+    Bedrock's per-account concurrency limits for generation models are low enough that
+    a fleet scaling out will collide with them. Because the retry sleeps in a durable
+    wait, waiting the limit out is unbilled and therefore far cheaper than losing the
+    task and re-running it.
+    """
+
+    def _run(self, submit_results):
+        """Run one session action whose submit returns the given results in order."""
+        attempts = []
+
+        def fake_submit(task_parameters, attempt=0):
+            attempts.append(attempt)
+            return submit_results[min(attempt, len(submit_results) - 1)]
+
+        context = FakeDurableContext()
+        with mock.patch.object(
+            durable_worker, "mark_action_started", lambda session_action_id: "T0"
+        ), mock.patch.object(
+            durable_worker, "submit_bedrock_job", fake_submit
+        ), mock.patch.object(
+            durable_worker,
+            "check_bedrock_job",
+            lambda invocation_arn: {
+                "status": "Completed",
+                "outputUri": "s3://b/o/",
+                "observedAt": "T2",
+            },
+        ):
+            action = _task_run_session()["session-1"]["sessionActions"][0]
+            result = durable_worker._run_session_action(context=context, action=action)
+        return result, attempts, context.waits
+
+    def test_a_throttled_submit_is_retried_after_a_wait(self):
+        throttled = {"invocationArn": None, "throttled": True, "error": "slow down"}
+        ok = {
+            "invocationArn": "arn:aws:bedrock:us-west-2:123456789012:async-invoke/abc",
+            "outputUri": "s3://b/o/",
+            "submittedAt": "T1",
+        }
+        result, attempts, waits = self._run([throttled, ok])
+
+        self.assertEqual(result["completedStatus"], "SUCCEEDED")
+        # Each retry is a distinct step, identified by its attempt number, so a replay
+        # re-submits instead of returning the first attempt's throttled result forever.
+        self.assertEqual(attempts[:2], [0, 1])
+        # The retry slept, and did so for the submit interval rather than the much
+        # shorter generation poll interval.
+        import bedrock_task
+
+        self.assertIn(bedrock_task.SUBMIT_RETRY_SECONDS, waits)
+
+    def test_a_non_throttle_error_fails_without_retrying(self):
+        bad = {"invocationArn": None, "throttled": False, "error": "bad prompt"}
+        result, attempts, waits = self._run([bad])
+
+        # A malformed request will never succeed, so retrying it only wastes time.
+        self.assertEqual(result["completedStatus"], "FAILED")
+        self.assertEqual(attempts, [0])
+        self.assertEqual(waits, [])
+        self.assertIn("bad prompt", result["progressMessage"])
 
 
 if __name__ == "__main__":

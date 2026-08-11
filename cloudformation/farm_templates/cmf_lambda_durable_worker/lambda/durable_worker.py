@@ -150,8 +150,15 @@ def poll_schedule(
 
 
 @durable_step
-def submit_bedrock_job(step_context, task_parameters: dict[str, Any]) -> dict[str, Any]:
-    """Start the asynchronous Bedrock request described by the task's parameters."""
+def submit_bedrock_job(
+    step_context, task_parameters: dict[str, Any], attempt: int = 0
+) -> dict[str, Any]:
+    """Start the asynchronous Bedrock request described by the task's parameters.
+
+    `attempt` is part of the step's arguments so each retry is a distinct step with its
+    own checkpoint. Without it a replay would return the first attempt's throttled
+    result forever instead of re-submitting.
+    """
     result = bedrock_task.start_generation(
         task_parameters=task_parameters, logger=step_context.logger
     )
@@ -337,7 +344,15 @@ def _run_session_action(
     # generated value so the S3 location is the same across replays.
     task_parameters = dict(task_parameters)
     task_parameters.setdefault("TaskId", definition["taskRun"].get("taskId") or session_action_id)
-    submission = context.step(submit_bedrock_job(task_parameters))
+    # Submit, retrying a throttle behind a durable wait. Bedrock's per-account
+    # concurrency limits for generation models are low, so several workers starting at
+    # once will collide; sleeping here is unbilled, which makes waiting out the limit
+    # far cheaper than failing the task.
+    for attempt in range(bedrock_task.MAX_SUBMIT_ATTEMPTS):
+        submission = context.step(submit_bedrock_job(task_parameters, attempt))
+        if submission.get("invocationArn") or not submission.get("throttled"):
+            break
+        context.wait(Duration.from_seconds(bedrock_task.SUBMIT_RETRY_SECONDS))
 
     if not submission.get("invocationArn"):
         return {

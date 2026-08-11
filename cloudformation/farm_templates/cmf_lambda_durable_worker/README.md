@@ -22,9 +22,20 @@ instead.
   costs nothing while it waits.
 * Graceful **scale-in that never abandons in-flight work**.
 
-In a measured run of three workers over roughly twelve minutes of combined worker
-lifetime, the fleet billed about 294 seconds of compute across 47 invocations. Idle
-polling and generation waits were not billed.
+In a measured three-worker run generating three clips, the workers were alive for a
+combined 754 seconds and spent 692 of those seconds (92%) suspended in durable waits.
+Billed Lambda compute was 62 seconds across 29 invocations, or 8% of worker lifetime.
+
+Getting there took two fixes worth knowing about if you adapt this sample, because both
+turn waiting into billed compute:
+
+* **Do not let botocore retry in process.** Its backoff sleeps inside the API call, and
+  that sleep is billed. A throttled `StartAsyncInvoke` was costing about 11 seconds of
+  billed time per attempt. Retrying behind a `context.wait()` instead makes the same
+  backoff free, and cut billed compute from 166 seconds to 91 on identical work.
+* **Cache your clients.** Building a credentialed `boto3.Session` plus client costs
+  roughly 80ms and cannot reuse botocore's warm loader cache, so a step that assumed the
+  fleet role and made one call paid it twice per network round trip.
 
 ## How it works
 
@@ -182,6 +193,11 @@ the worker was suspended and unbilled.
 | `ModelId` | `luma.ray-v2:0` | Async-capable Bedrock model to invoke |
 | `GenerationPollSeconds` | `30` | Sleep between checks on an in-flight request |
 
+Two further settings are read from the environment rather than exposed as stack
+parameters: `SUBMIT_RETRY_SECONDS` (default 60) and `MAX_SUBMIT_ATTEMPTS` (default 10)
+control how long and how many times a throttled submit waits before retrying. Raising
+the interval costs nothing, since the wait is suspended.
+
 Stack outputs give the `FleetId`, the worker function alias ARN, the scaling function
 name, the output bucket, and the registry table. Generated files land in
 `s3://<OutputBucket>/generated/<taskId>/<invocationId>/output.mp4`.
@@ -206,8 +222,8 @@ Costs come from Bedrock generation, which dominates, plus Lambda compute for the
 active periods, DynamoDB and S3 at negligible volume, and Deadline Cloud CMF worker
 usage. `MaxWorkerCount` is the concurrency and cost ceiling. Bedrock's per-account
 concurrency limits for generation models are low, so several workers starting at once
-will hit throttling; the worker treats throttles as retryable and backs off rather than
-failing the task.
+will hit throttling; the worker retries behind a durable wait rather than failing the
+task, which is why the retry is unbilled.
 
 To clean up:
 

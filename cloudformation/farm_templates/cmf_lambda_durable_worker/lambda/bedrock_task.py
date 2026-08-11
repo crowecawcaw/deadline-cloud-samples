@@ -23,6 +23,7 @@ from functools import lru_cache
 from typing import Any, Optional
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 # How long to sleep between `GetAsyncInvoke` polls, and how many polls to allow.
@@ -31,6 +32,12 @@ from botocore.exceptions import ClientError
 # soon the worker notices completion.
 GENERATION_POLL_SECONDS = int(os.environ.get("GENERATION_POLL_SECONDS", "30"))
 MAX_GENERATION_POLLS = int(os.environ.get("MAX_GENERATION_POLLS", "120"))
+
+# How many times to re-submit a request that was throttled, and how long to sleep first.
+# The sleep happens in a durable wait, so a long interval costs nothing and gives the
+# per-account concurrency limit real time to clear.
+SUBMIT_RETRY_SECONDS = int(os.environ.get("SUBMIT_RETRY_SECONDS", "60"))
+MAX_SUBMIT_ATTEMPTS = int(os.environ.get("MAX_SUBMIT_ATTEMPTS", "10"))
 
 OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET", "")
 DEFAULT_MODEL_ID = os.environ.get("MODEL_ID", "luma.ray-v2:0")
@@ -59,8 +66,19 @@ def _client():
     Lambda reuses a warm environment across the many invocations that make up one
     durable execution, so caching here means the client is built once rather than on
     every submit and status check.
+
+    Retries are disabled deliberately. botocore's default retry mode sleeps inside the
+    call before raising, and that sleep is billed Lambda compute: a throttled
+    StartAsyncInvoke was costing 11 seconds of billed time per attempt while botocore
+    backed off in process. Letting the throttle surface immediately hands the retry to
+    the durable step, which suspends the execution between attempts instead, so the
+    same backoff costs nothing.
     """
-    return boto3.client("bedrock-runtime", region_name=REGION)
+    return boto3.client(
+        "bedrock-runtime",
+        region_name=REGION,
+        config=Config(retries={"max_attempts": 1, "mode": "standard"}),
+    )
 
 
 def build_model_input(task_parameters: dict[str, Any]) -> dict[str, Any]:
@@ -114,12 +132,15 @@ def start_generation(
         code = exc.response.get("Error", {}).get("Code", "")
         message = exc.response.get("Error", {}).get("Message", str(exc))
         if code in _RETRYABLE_ERROR_CODES:
-            # Propagate so the durable step retries with backoff instead of failing
-            # a task that is only temporarily blocked.
-            log.warning(f"StartAsyncInvoke throttled, will retry: {message}")
-            raise
+            # Report the throttle instead of raising. Raising would leave the retry to
+            # the durable step, whose attempts are finite and close together, so a
+            # fleet that scales out into a throttling window exhausts them and fails
+            # the task. Returning lets the caller retry behind a durable wait, which
+            # is both unbilled and long enough for the limit to clear.
+            log.warning(f"StartAsyncInvoke throttled: {message}")
+            return {"invocationArn": None, "throttled": True, "error": message}
         log.error(f"StartAsyncInvoke failed: {message}")
-        return {"invocationArn": None, "error": message}
+        return {"invocationArn": None, "throttled": False, "error": message}
 
     invocation_arn = response["invocationArn"]
     log.info(f"Started generation {invocation_arn}")

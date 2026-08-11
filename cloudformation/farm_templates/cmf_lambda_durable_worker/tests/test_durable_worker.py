@@ -193,17 +193,19 @@ class TestThrottleHandling(unittest.TestCase):
             {"Error": {"Code": code, "Message": f"simulated {code}"}}, "StartAsyncInvoke"
         )
 
-    def test_throttling_propagates_for_retry(self):
+    def test_throttling_is_reported_as_retryable(self):
         import unittest.mock as mock
 
         with mock.patch.object(bedrock_task, "_client") as fake:
             fake.return_value.start_async_invoke.side_effect = self._client_error(
                 "ThrottlingException"
             )
-            # Raising is what lets the durable step retry with backoff.
-            with self.assertRaises(Exception) as caught:
-                bedrock_task.start_generation(task_parameters={"Prompt": "x"})
-            self.assertIn("ThrottlingException", str(caught.exception))
+            result = bedrock_task.start_generation(task_parameters={"Prompt": "x"})
+        # Reported rather than raised, so the caller can retry behind a durable wait.
+        # Raising would leave it to the step's finite, closely spaced retries, which a
+        # throttling window outlasts.
+        self.assertIsNone(result["invocationArn"])
+        self.assertTrue(result["throttled"])
 
     def test_validation_error_fails_the_task(self):
         import unittest.mock as mock
@@ -213,8 +215,9 @@ class TestThrottleHandling(unittest.TestCase):
                 "ValidationException"
             )
             result = bedrock_task.start_generation(task_parameters={"Prompt": "x"})
-        # A malformed request will never succeed, so it is reported, not retried.
+        # A malformed request will never succeed, so it is reported and not retried.
         self.assertIsNone(result["invocationArn"])
+        self.assertFalse(result["throttled"])
         self.assertIn("ValidationException", result["error"])
 
 
