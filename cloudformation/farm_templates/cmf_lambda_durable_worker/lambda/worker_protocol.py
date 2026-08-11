@@ -65,22 +65,35 @@ class DeadlineWorker:
         self.region = region
         self.worker_id = worker_id
         self._credentials = credentials
+        self._client_cache: dict[bool, Any] = {}
 
     # -- clients ---------------------------------------------------------------
 
     def _client(self, *, use_worker_credentials: bool):
-        """Build a Deadline Cloud client.
+        """Return a Deadline Cloud client, building it once per credential set.
 
         Registration happens with the Lambda execution role, which holds only
         `deadline:CreateWorker` and `deadline:AssumeFleetRoleForWorker`. Everything
         afterwards uses the worker-scoped fleet role credentials, mirroring the
         least-privilege split the worker agent uses on EC2.
+
+        Clients are cached because building one is expensive relative to the call it
+        makes: constructing a credentialed `boto3.Session` plus client costs roughly
+        80ms, and unlike the default session it cannot reuse botocore's warm loader
+        cache. A step that assumed the fleet role and then made one API call was
+        paying that twice for a single network round trip.
         """
+        if use_worker_credentials and not self._credentials:
+            raise WorkerProtocolError(
+                "Worker credentials are required but have not been obtained yet."
+            )
+
+        cached = self._client_cache.get(use_worker_credentials)
+        if cached is not None:
+            return cached
+
         if use_worker_credentials:
-            if not self._credentials:
-                raise WorkerProtocolError(
-                    "Worker credentials are required but have not been obtained yet."
-                )
+            assert self._credentials is not None  # guarded above
             session = boto3.Session(
                 aws_access_key_id=self._credentials["accessKeyId"],
                 aws_secret_access_key=self._credentials["secretAccessKey"],
@@ -89,7 +102,9 @@ class DeadlineWorker:
             )
         else:
             session = boto3.Session(region_name=self.region)
-        return session.client("deadline", config=DEADLINE_BOTOCORE_CONFIG)
+        client = session.client("deadline", config=DEADLINE_BOTOCORE_CONFIG)
+        self._client_cache[use_worker_credentials] = client
+        return client
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -118,6 +133,9 @@ class DeadlineWorker:
         )
         credentials = response["credentials"]
         self._credentials = credentials
+        # Drop the cached worker client so the next call picks up these credentials
+        # rather than continuing to sign with the previous, possibly expired, set.
+        self._client_cache.pop(True, None)
         return {
             "accessKeyId": credentials["accessKeyId"],
             "secretAccessKey": credentials["secretAccessKey"],
@@ -128,6 +146,7 @@ class DeadlineWorker:
     def set_credentials(self, credentials: dict[str, Any]) -> None:
         """Restore credentials obtained by an earlier call."""
         self._credentials = credentials
+        self._client_cache.pop(True, None)
 
     def update_worker_status(
         self, *, status: str, capabilities: Optional[dict[str, Any]] = None

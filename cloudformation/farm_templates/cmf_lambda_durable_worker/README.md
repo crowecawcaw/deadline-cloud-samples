@@ -232,10 +232,16 @@ it and the artifacts bucket by hand when you no longer need them.
 | [`lambda/bedrock_task.py`](lambda/bedrock_task.py) | Maps task parameters to async Bedrock requests |
 | [`lambda/scaling_handler.py`](lambda/scaling_handler.py) | Turns scaling events into worker executions |
 | [`lambda/worker_registry.py`](lambda/worker_registry.py) | Live-worker registry and drain flag |
-| [`tests/`](tests/) | Unit tests for the replay-sensitive logic |
+| [`tests/`](tests/) | Unit tests: data transformations, scaling arithmetic, registry, and worker loop exit paths |
 
 Run the tests with:
 
 ```console
 python3 -m unittest discover -s tests
 ```
+
+The tests need no credentials and make no AWS calls. They cover the scaling
+arithmetic, the drain registry, and the worker loop's exit paths, including a
+regression guard that a drain finishes work already assigned to it. Because the
+durable execution SDK is stubbed, they verify loop control flow and data handling
+rather than checkpoint and replay behavior, which only a live run exercises.

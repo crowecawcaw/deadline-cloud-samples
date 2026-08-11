@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from functools import lru_cache
 
 import boto3
 from botocore.exceptions import ClientError
@@ -31,7 +31,9 @@ logger = logging.getLogger(__name__)
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "")
 
 
+@lru_cache(maxsize=1)
 def _table():
+    """Return the registry table, built once per execution environment."""
     return boto3.resource("dynamodb").Table(REGISTRY_TABLE)
 
 
@@ -76,7 +78,7 @@ def deregister(*, fleet_id: str, worker_id: str) -> None:
         logger.error(f"Failed to remove {worker_id} from the registry: {exc}")
 
 
-def utc_now_iso(clock: Optional[object] = None) -> str:
+def utc_now_iso() -> str:
     """Return the current UTC time in ISO-8601 form.
 
     Only ever called inside a durable step. A clock read is non-deterministic, so

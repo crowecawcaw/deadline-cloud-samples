@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
 from typing import Any, Optional
 
 import boto3
@@ -51,7 +52,14 @@ _RETRYABLE_ERROR_CODES = frozenset(
 )
 
 
+@lru_cache(maxsize=1)
 def _client():
+    """Return the Bedrock client, built once per execution environment.
+
+    Lambda reuses a warm environment across the many invocations that make up one
+    durable execution, so caching here means the client is built once rather than on
+    every submit and status check.
+    """
     return boto3.client("bedrock-runtime", region_name=REGION)
 
 
