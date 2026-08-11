@@ -14,9 +14,15 @@ Only the calls a worker must make are covered:
     UpdateWorkerSchedule      -> heartbeat, receive work, report progress
     DeleteWorker              -> deregister
 
-Every method is a plain request/response call with no local state, which keeps the
-caller free to wrap each one in a durable step. See the module docstring in
-`durable_worker.py` for how that interacts with checkpoint replay.
+Every method is a plain request/response call, which keeps the caller free to wrap each
+one in a durable step. See the module docstring in `durable_worker.py` for how that
+interacts with checkpoint replay.
+
+Credentials are the one piece of state held here. `AssumeFleetRoleForWorker` is wrapped
+in botocore's `RefreshableCredentials`, so botocore tracks expiry and re-assumes the
+role itself while signing. Callers therefore never assume the role, check an expiry, or
+checkpoint a credential blob: the role is assumed on first use, and a worker that wakes
+from a long suspension signs with credentials botocore has already renewed.
 """
 
 from __future__ import annotations
@@ -25,7 +31,9 @@ import logging
 from typing import Any, Optional
 
 import boto3
+import botocore.session
 from botocore.config import Config
+from botocore.credentials import RefreshableCredentials
 
 logger = logging.getLogger(__name__)
 
@@ -68,47 +76,83 @@ class DeadlineWorker:
         self.fleet_id = fleet_id
         self.region = region
         self.worker_id = worker_id
-        self._credentials = credentials
         self._client_cache: dict[bool, Any] = {}
+        self._worker_credentials: Optional[RefreshableCredentials] = None
+        if credentials:
+            self.set_credentials(credentials)
 
     # -- clients ---------------------------------------------------------------
 
-    def _client(self, *, use_worker_credentials: bool):
-        """Return a Deadline Cloud client, building it once per credential set.
+    def _bootstrap_client(self):
+        """A client using the Lambda execution role.
 
-        Registration happens with the Lambda execution role, which holds only
-        `deadline:CreateWorker` and `deadline:AssumeFleetRoleForWorker`. Everything
-        afterwards uses the worker-scoped fleet role credentials, mirroring the
-        least-privilege split the worker agent uses on EC2.
-
-        Clients are cached because building one is expensive relative to the call it
-        makes: constructing a credentialed `boto3.Session` plus client costs roughly
-        80ms, and unlike the default session it cannot reuse botocore's warm loader
-        cache. A step that assumed the fleet role and then made one API call was
-        paying that twice for a single network round trip.
+        That role holds only `deadline:CreateWorker` and
+        `deadline:AssumeFleetRoleForWorker`, mirroring the least-privilege split the
+        worker agent uses on EC2.
         """
-        if use_worker_credentials and not self._credentials:
-            raise WorkerProtocolError(
-                "Worker credentials are required but have not been obtained yet."
+        client = self._client_cache.get(False)
+        if client is None:
+            client = boto3.Session(region_name=self.region).client(
+                "deadline", config=DEADLINE_BOTOCORE_CONFIG
             )
-
-        cached = self._client_cache.get(use_worker_credentials)
-        if cached is not None:
-            return cached
-
-        if use_worker_credentials:
-            assert self._credentials is not None  # guarded above
-            session = boto3.Session(
-                aws_access_key_id=self._credentials["accessKeyId"],
-                aws_secret_access_key=self._credentials["secretAccessKey"],
-                aws_session_token=self._credentials["sessionToken"],
-                region_name=self.region,
-            )
-        else:
-            session = boto3.Session(region_name=self.region)
-        client = session.client("deadline", config=DEADLINE_BOTOCORE_CONFIG)
-        self._client_cache[use_worker_credentials] = client
+            self._client_cache[False] = client
         return client
+
+    def _worker_client(self):
+        """A client signing with the worker-scoped fleet role.
+
+        The credentials are botocore `RefreshableCredentials`, so botocore tracks
+        expiry and calls `AssumeFleetRoleForWorker` again itself when they are close to
+        expiring. That matters here because a durable worker can stay suspended for
+        longer than a credential's lifetime; the alternative is re-assuming the role
+        before every call and reasoning about expiry by hand.
+
+        Clients are cached because building one costs roughly 80ms, and with
+        refreshable credentials a client stays usable for the worker's whole life, so
+        there is nothing to invalidate.
+        """
+        if self._worker_credentials is None:
+            if not self.worker_id:
+                raise WorkerProtocolError(
+                    "A worker ID is required before the fleet role can be assumed."
+                )
+            # Assume the role on first use rather than making every caller remember to
+            # do it. Each durable step runs in its own invocation with a fresh instance,
+            # so this happens once per step that talks to the service.
+            self.assume_fleet_role()
+        client = self._client_cache.get(True)
+        if client is None:
+            # Hand botocore the refreshable credentials directly; it invokes their
+            # refresh callback as needed while signing.
+            botocore_session = botocore.session.get_session()
+            botocore_session._credentials = self._worker_credentials
+            client = boto3.Session(
+                botocore_session=botocore_session, region_name=self.region
+            ).client("deadline", config=DEADLINE_BOTOCORE_CONFIG)
+            self._client_cache[True] = client
+        return client
+
+    def _client(self, *, use_worker_credentials: bool):
+        """Return the client for the requested identity."""
+        return self._worker_client() if use_worker_credentials else self._bootstrap_client()
+
+    def _fetch_fleet_role_credentials(self) -> dict[str, Any]:
+        """Call AssumeFleetRoleForWorker, shaped for botocore.
+
+        This is the refresh callback botocore invokes, so the keys are the ones
+        `RefreshableCredentials` expects rather than the API's own spelling.
+        """
+        response = self._bootstrap_client().assume_fleet_role_for_worker(
+            farmId=self.farm_id, fleetId=self.fleet_id, workerId=self.worker_id
+        )
+        credentials = response["credentials"]
+        logger.info("Obtained fleet role credentials for worker %s", self.worker_id)
+        return {
+            "access_key": credentials["accessKeyId"],
+            "secret_key": credentials["secretAccessKey"],
+            "token": credentials["sessionToken"],
+            "expiry_time": credentials["expiration"].isoformat(),
+        }
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -124,32 +168,37 @@ class DeadlineWorker:
         logger.info("Created worker %s in fleet %s", self.worker_id, self.fleet_id)
         return self.worker_id
 
-    def assume_fleet_role(self) -> dict[str, Any]:
-        """Fetch worker-scoped credentials for this worker.
+    def assume_fleet_role(self) -> None:
+        """Obtain worker-scoped credentials that refresh themselves.
 
-        Returns the credentials so the caller can checkpoint them. They are
-        short-lived, so a worker that wakes from a long sleep refreshes rather than
-        reusing a replayed value.
+        Called once after the worker ID is known. Afterwards botocore keeps the
+        credentials current, so callers do not re-assume the role before each request
+        and nothing needs to be checkpointed: credentials are far shorter-lived than a
+        durable execution, so a replayed copy would usually be expired anyway.
         """
-        client = self._client(use_worker_credentials=False)
-        response = client.assume_fleet_role_for_worker(
-            farmId=self.farm_id, fleetId=self.fleet_id, workerId=self.worker_id
+        self._worker_credentials = RefreshableCredentials.create_from_metadata(
+            metadata=self._fetch_fleet_role_credentials(),
+            refresh_using=self._fetch_fleet_role_credentials,
+            method="deadline-assume-fleet-role-for-worker",
         )
-        credentials = response["credentials"]
-        self._credentials = credentials
-        # Drop the cached worker client so the next call picks up these credentials
-        # rather than continuing to sign with the previous, possibly expired, set.
-        self._client_cache.pop(True, None)
-        return {
-            "accessKeyId": credentials["accessKeyId"],
-            "secretAccessKey": credentials["secretAccessKey"],
-            "sessionToken": credentials["sessionToken"],
-            "expiration": credentials["expiration"].isoformat(),
-        }
 
     def set_credentials(self, credentials: dict[str, Any]) -> None:
-        """Restore credentials obtained by an earlier call."""
-        self._credentials = credentials
+        """Adopt credentials obtained elsewhere, keeping them refreshable.
+
+        Accepts the API's own spelling, as returned by `AssumeFleetRoleForWorker`.
+        Refresh still goes through this worker's own callback, so credentials adopted
+        here stay current for as long as the worker runs.
+        """
+        self._worker_credentials = RefreshableCredentials.create_from_metadata(
+            metadata={
+                "access_key": credentials["accessKeyId"],
+                "secret_key": credentials["secretAccessKey"],
+                "token": credentials["sessionToken"],
+                "expiry_time": _as_iso(credentials["expiration"]),
+            },
+            refresh_using=self._fetch_fleet_role_credentials,
+            method="deadline-assume-fleet-role-for-worker",
+        )
         self._client_cache.pop(True, None)
 
     def update_worker_status(
@@ -209,6 +258,15 @@ class DeadlineWorker:
             logger.info("Deleted worker %s", self.worker_id)
         except client.exceptions.ResourceNotFoundException:
             logger.info("Worker %s was already deleted", self.worker_id)
+
+
+def _as_iso(expiration: Any) -> str:
+    """Return an expiry as an ISO-8601 string.
+
+    botocore parses `expiration` into a datetime, but a caller restoring credentials
+    from JSON will have a string. Accept either.
+    """
+    return expiration if isinstance(expiration, str) else expiration.isoformat()
 
 
 def _deserialize_timestamps(

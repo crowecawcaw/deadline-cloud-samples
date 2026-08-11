@@ -22,12 +22,50 @@ instead.
   costs nothing while it waits.
 * Graceful **scale-in that never abandons in-flight work**.
 
-In a measured three-worker run generating three clips, the workers were alive for a
-combined 754 seconds and spent 692 of those seconds (92%) suspended in durable waits.
-Billed Lambda compute was 62 seconds across 29 invocations, or 8% of worker lifetime.
+## The cost model
 
-Getting there took two fixes worth knowing about if you adapt this sample, because both
-turn waiting into billed compute:
+The motivation is as much economic as architectural. When the actual work happens in
+another service, a conventional worker holds compute it is not using: an Amazon EC2
+instance or a service-managed fleet worker is billed for the whole time a job is
+assigned to it, including the minutes it spends blocked on someone else's API call. A
+durable function inverts that. The worker stays registered and keeps heartbeating, but
+suspends between calls and is billed only while it is running code.
+
+What you pay either way:
+
+| | Conventional worker | Durable Lambda worker |
+|---|---|---|
+| Deadline Cloud CMF worker usage | yes, while the worker exists | yes, while the worker exists |
+| Compute | the full worker lifetime | only the seconds spent running code |
+| The external service | its own charges | its own charges |
+
+The Deadline Cloud customer-managed fleet worker charge still applies and does not
+change: a registered worker is a registered worker. What changes is the compute bill
+underneath it, and the external service's charges are unaffected either way.
+
+### A measured example
+
+Three workers generating three clips, from the run used to validate this sample:
+
+* combined worker lifetime: **665 seconds**
+* suspended in durable waits: **614 seconds (92%)**
+* billed Lambda compute: **51 seconds** across 24 invocations, or **8%** of lifetime
+
+At 512 MB in `us-west-2` that is about 25.6 GB-seconds, so roughly **$0.0004** in Lambda
+charges for the whole run, or about **$0.014 per 100 clips**. Compute is not the
+interesting line item at this scale, which is the point: the same three clips on a
+conventional worker would have billed an instance for all 665 seconds while it waited.
+
+Two caveats keep this honest. Bedrock generation dominates the total bill by orders of
+magnitude, so this pattern optimizes the smaller half of the cost. And the saving only
+appears for work that genuinely waits on another service; a worker doing local
+computation is billed for that computation whether it runs in Lambda or on an instance,
+and the instance is likely cheaper.
+
+### Two ways to lose the saving
+
+Reaching 8% took two fixes, both worth knowing if you adapt this sample, because both
+quietly turn waiting back into billed compute:
 
 * **Do not let botocore retry in process.** Its backoff sleeps inside the API call, and
   that sleep is billed. A throttled `StartAsyncInvoke` was costing about 11 seconds of
@@ -93,6 +131,12 @@ requirement, and the worker follows three rules:
    the top level of the handler.
 3. Timestamps are captured inside steps. `UpdateWorkerSchedule` requires `startedAt` on
    any completed action, and a value read outside a checkpoint would drift each replay.
+
+Credentials are deliberately *not* checkpointed. They are far shorter-lived than a
+durable execution, so a replayed copy would usually be expired. Instead the worker wraps
+`AssumeFleetRoleForWorker` in botocore's `RefreshableCredentials` and lets botocore
+track expiry and re-assume the role while signing, which is the same mechanism the AWS
+SDKs use for instance and container credentials.
 
 ### Scaling in without losing work
 
@@ -218,12 +262,12 @@ transition to `STARTED`, and without it the worker never leaves `CREATED`) and
 `CreateWorker`, `ListWorkers`, and `DeleteWorker` authorize against the *worker*
 resource, so their ARNs end in `/worker/*`.
 
-Costs come from Bedrock generation, which dominates, plus Lambda compute for the brief
-active periods, DynamoDB and S3 at negligible volume, and Deadline Cloud CMF worker
-usage. `MaxWorkerCount` is the concurrency and cost ceiling. Bedrock's per-account
-concurrency limits for generation models are low, so several workers starting at once
-will hit throttling; the worker retries behind a durable wait rather than failing the
-task, which is why the retry is unbilled.
+Costs are broken down in [The cost model](#the-cost-model) above: Bedrock generation
+dominates, with Lambda compute for the brief active periods, Deadline Cloud CMF worker
+usage, and DynamoDB and S3 at negligible volume. `MaxWorkerCount` is the concurrency and
+cost ceiling. Bedrock's per-account concurrency limits for generation models are low, so
+several workers starting at once will hit throttling; the worker retries behind a durable
+wait rather than failing the task, which is why the retry is unbilled.
 
 To clean up:
 

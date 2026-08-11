@@ -86,7 +86,7 @@ def register_worker(step_context, host_name: str) -> dict[str, Any]:
     """
     worker = DeadlineWorker(farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION)
     worker_id = worker.create_worker(host_name=host_name)
-    worker.assume_fleet_role()
+    # The fleet role is assumed on first use, so no explicit call is needed here.
     worker.update_worker_status(status="STARTED", capabilities=default_capabilities())
     worker_registry.register(
         fleet_id=FLEET_ID, worker_id=worker_id, started_at=worker_registry.utc_now_iso()
@@ -116,13 +116,12 @@ def poll_schedule(
 ) -> dict[str, Any]:
     """Send a heartbeat with any progress, and collect newly assigned work.
 
-    Credentials are acquired fresh here because this step runs after a wait, when a
-    replayed credential blob would likely have expired.
+    Credentials are obtained on first use and refreshed by botocore, so nothing about
+    expiry needs handling here even though this step runs after a suspension.
     """
     worker = DeadlineWorker(
         farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
     )
-    worker.assume_fleet_role()
     try:
         response = worker.update_worker_schedule(
             updated_session_actions=updated_session_actions
@@ -193,7 +192,6 @@ def deregister_worker(step_context, worker_id: str) -> dict[str, Any]:
         farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
     )
     try:
-        worker.assume_fleet_role()
         worker.update_worker_status(status="STOPPING")
         worker.update_worker_status(status="STOPPED")
         worker.delete_worker()

@@ -256,18 +256,107 @@ class TestTimestampConversion(unittest.TestCase):
         self.assertIsInstance(original["action-1"]["startedAt"], str)
 
 
-class TestWorkerProtocolGuards(unittest.TestCase):
-    def test_worker_credentials_are_required_for_scheduling_calls(self):
-        # Calling a worker-credentialed API before AssumeFleetRoleForWorker is a
-        # programming error, and should say so rather than fail inside botocore.
-        worker = worker_protocol.DeadlineWorker(
-            farm_id="farm-" + "0" * 32,
-            fleet_id="fleet-" + "0" * 32,
-            region="us-west-2",
-            worker_id="worker-" + "0" * 32,
+class TestWorkerCredentials(unittest.TestCase):
+    """Credentials are obtained on first use and kept current by botocore."""
+
+    FARM = "farm-" + "0" * 32
+    FLEET = "fleet-" + "0" * 32
+    WORKER = "worker-" + "0" * 32
+
+    @staticmethod
+    def _api_credentials(expiration):
+        """A credentials block shaped the way AssumeFleetRoleForWorker returns one."""
+        return {
+            "accessKeyId": "AKIAEXAMPLE",
+            "secretAccessKey": "secret",
+            "sessionToken": "token",
+            "expiration": expiration,
+        }
+
+    def _worker(self, **kwargs):
+        return worker_protocol.DeadlineWorker(
+            farm_id=self.FARM, fleet_id=self.FLEET, region="us-west-2", **kwargs
         )
+
+    def test_a_worker_id_is_required_before_the_role_can_be_assumed(self):
+        # Without a worker ID there is nothing to assume the role for, and saying so is
+        # clearer than letting the request fail inside botocore.
+        worker = self._worker()
         with self.assertRaises(worker_protocol.WorkerProtocolError):
             worker.update_worker_schedule()
+
+    def test_the_fleet_role_is_assumed_on_first_use(self):
+        import unittest.mock as mock
+        from datetime import datetime, timedelta, timezone
+
+        worker = self._worker(worker_id=self.WORKER)
+        fetched = {
+            "access_key": "AKIAFETCHED",
+            "secret_key": "secret",
+            "token": "token",
+            "expiry_time": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        }
+        # Callers no longer assume the role themselves, so the first client build has
+        # to do it. Patching the fetch keeps this off the network.
+        with mock.patch.object(
+            worker, "_fetch_fleet_role_credentials", return_value=fetched
+        ) as fetch:
+            worker._worker_client()
+            fetch.assert_called_once()
+            # Cached: a second call must not re-assume or rebuild.
+            worker._worker_client()
+            fetch.assert_called_once()
+
+    def test_credentials_are_refreshable_rather_than_static(self):
+        from datetime import datetime, timedelta, timezone
+        from botocore.credentials import RefreshableCredentials
+
+        worker = self._worker(worker_id=self.WORKER)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+        worker.set_credentials(self._api_credentials(expiry))
+
+        # Refreshable, not static: a durable worker can stay suspended for longer than
+        # a credential's lifetime, so botocore has to be able to renew them itself.
+        self.assertIsInstance(worker._worker_credentials, RefreshableCredentials)
+        self.assertEqual(worker._worker_credentials.access_key, "AKIAEXAMPLE")
+
+    def test_an_expiry_string_is_accepted_as_well_as_a_datetime(self):
+        from datetime import datetime, timedelta, timezone
+
+        worker = self._worker(worker_id=self.WORKER)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+        # botocore parses expiration into a datetime, but credentials restored from
+        # JSON arrive as a string. Both have to work.
+        worker.set_credentials(self._api_credentials(expiry.isoformat()))
+        self.assertEqual(worker._worker_credentials.access_key, "AKIAEXAMPLE")
+
+    def test_expiring_credentials_are_renewed_through_the_worker_callback(self):
+        import unittest.mock as mock
+        from datetime import datetime, timedelta, timezone
+
+        worker = self._worker(worker_id=self.WORKER)
+        renewed = {
+            "access_key": "AKIARENEWED",
+            "secret_key": "secret2",
+            "token": "token2",
+            "expiry_time": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+        }
+        # Patch before setting credentials: the refresh callback is bound when the
+        # credentials are created, so patching afterwards would leave the real method
+        # wired in and the refresh would hit the network.
+        with mock.patch.object(
+            worker, "_fetch_fleet_role_credentials", return_value=renewed
+        ) as fetch:
+            # Already inside the mandatory refresh window, so reading the credentials
+            # must renew them instead of handing back a nearly expired key.
+            worker.set_credentials(
+                self._api_credentials(datetime.now(timezone.utc) + timedelta(seconds=1))
+            )
+            frozen = worker._worker_credentials.get_frozen_credentials()
+        fetch.assert_called()
+        self.assertEqual(frozen.access_key, "AKIARENEWED")
 
 
 if __name__ == "__main__":
