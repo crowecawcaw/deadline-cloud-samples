@@ -102,6 +102,12 @@ Resources:
               # fleet here would make the two resources depend on each other. The
               # trust policy already restricts this role to Deadline Cloud, which
               # hands it only to workers it has created.
+              # Used to fetch a queue environment's template when the service assigns
+              # an envEnter action. Authorizes against the worker resource, like the
+              # other worker actions.
+              - Effect: Allow
+                Action: deadline:BatchGetJobEntity
+                Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
               - Effect: Allow
                 Action: deadline:DeleteWorker
                 Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*

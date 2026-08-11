@@ -58,10 +58,12 @@ from aws_durable_execution_sdk_python.config import (  # type: ignore[import-not
 )
 
 import bedrock_task
+import queue_environment
 import worker_registry
 from worker_protocol import (
     DeadlineWorker,
     WorkerNotUsableError,
+    WorkerProtocolError,
     default_capabilities,
 )
 
@@ -148,6 +150,32 @@ def heartbeat(step_context, worker_id: str, progress: dict[str, Any]) -> dict[st
         "desiredWorkerStatus": response.get("desiredWorkerStatus"),
         "cancelSessionActions": response.get("cancelSessionActions", {}),
     }
+
+
+@durable_step
+def enter_queue_environment(
+    step_context, worker_id: str, job_id: str, environment_id: str
+) -> dict[str, Any]:
+    """Fetch a queue environment's template and apply what this worker can.
+
+    Returns the variables the environment defines, or an error explaining why the
+    environment cannot be honored. The error is returned rather than raised so the
+    caller fails one action instead of the whole execution.
+    """
+    worker = DeadlineWorker(
+        farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
+    )
+    try:
+        details = worker.get_environment_details(
+            job_id=job_id, environment_id=environment_id
+        )
+        variables = queue_environment.apply(
+            environment_details=details, logger_=step_context.logger
+        )
+        return {"variables": variables}
+    except (queue_environment.UnsupportedEnvironmentError, WorkerProtocolError) as exc:
+        step_context.logger.error(f"Queue environment {environment_id} failed: {exc}")
+        return {"error": str(exc)}
 
 
 @durable_step
@@ -261,17 +289,14 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
     registration = context.step(register_worker(host_name))
     worker_id = registration["workerId"]
 
-    # Progress to report on the next heartbeat. UpdateWorkerSchedule is both the
-    # heartbeat and the progress-reporting call, so completed work rides along with
-    # the next poll instead of needing a separate request.
-    pending_updates: dict[str, Any] = {}
     idle_polls = 0
     tasks_completed = 0
     stop_reason = "loop-limit-reached"
 
     for _ in range(MAX_LOOP_ITERATIONS):
-        poll = context.step(poll_schedule(worker_id, pending_updates))
-        pending_updates = {}
+        # Results are reported as each action completes, so a poll only ever needs to
+        # ask for work.
+        poll = context.step(poll_schedule(worker_id, {}))
 
         if poll["workerDeleted"]:
             # Nothing left to drain, and no valid worker ID to drain it with.
@@ -287,14 +312,12 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
 
         if poll.get("drainRequested"):
             # Scale-in. Any work already assigned in this poll is finished first, so
-            # draining never abandons a request in flight. The results land in
-            # pending_updates and are reported by the final heartbeat below.
+            # draining never abandons a request in flight.
             stop_reason = "scale-in-drain"
             tasks_completed += _finish_assigned_work(
                 context=context,
                 worker_id=worker_id,
                 poll=poll,
-                pending_updates=pending_updates,
             )
             break
 
@@ -314,13 +337,7 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
             context=context,
             worker_id=worker_id,
             poll=poll,
-            pending_updates=pending_updates,
         )
-
-    # Report the final batch of results before draining, otherwise the last task's
-    # outcome is never seen by the service.
-    if pending_updates:
-        context.step(poll_schedule(worker_id, pending_updates))
 
     context.step(deregister_worker(worker_id))
     return {
@@ -335,23 +352,52 @@ def _finish_assigned_work(
     context: DurableContext,
     worker_id: str,
     poll: dict[str, Any],
-    pending_updates: dict[str, Any],
 ) -> int:
-    """Run every action assigned by this poll, recording results for the next beat.
+    """Run every action assigned by this poll, reporting each result as it completes.
 
-    Results accumulate in `pending_updates` rather than being reported immediately,
-    because `UpdateWorkerSchedule` carries both the heartbeat and the progress report.
+    Each result is reported in its own `UpdateWorkerSchedule` call, in the order the
+    service assigned the actions. The service enforces that order and rejects the whole
+    request otherwise: reporting action 1 before action 0 fails with "comes in a wrong
+    order", which loses every result in the batch, not just the out-of-order one. So
+    results cannot be accumulated and sent together.
+
     Returns the number of actions that succeeded.
+
+    One action that does not succeed stops the rest of its session: the service will not
+    run further `taskRun`, `envEnter`, or `syncInputJobAttachments` actions once any
+    action in the session has failed, been canceled, or been interrupted. Continuing
+    anyway would submit Bedrock requests whose results the service discards. `envExit`
+    actions still run, because they are the session's cleanup and have to happen even on
+    the failure path.
     """
     succeeded = 0
     for session in (poll.get("assignedSessions") or {}).values():
+        session_failed = False
         for action in session["sessionActions"]:
-            result = _run_session_action(
-                context=context, worker_id=worker_id, action=action
-            )
-            pending_updates[action["sessionActionId"]] = result
-            if result.get("completedStatus") == "SUCCEEDED":
-                succeeded += 1
+            action_id = action["sessionActionId"]
+            is_env_exit = "envExit" in action.get("definition", {})
+
+            if session_failed and not is_env_exit:
+                result = {
+                    # No timestamps: the action was never started, and the service
+                    # rejects a NEVER_ATTEMPTED report that claims to have run.
+                    "completedStatus": "NEVER_ATTEMPTED",
+                    "progressMessage": "An earlier action in this session did not succeed",
+                }
+            else:
+                result = _run_session_action(
+                    context=context,
+                    worker_id=worker_id,
+                    job_id=session["jobId"],
+                    action=action,
+                )
+                if result.get("completedStatus") == "SUCCEEDED":
+                    succeeded += 1
+                else:
+                    session_failed = True
+
+            # Report this result on its own, before moving to the next action.
+            context.step(poll_schedule(worker_id, {action_id: result}))
     return succeeded
 
 
@@ -359,13 +405,14 @@ def _run_session_action(
     *,
     context: DurableContext,
     worker_id: str,
+    job_id: str,
     action: dict[str, Any],
 ) -> dict[str, Any]:
     """Run one assigned session action and return its result for the next heartbeat.
 
-    Deadline Cloud assigns environment enter/exit actions around task runs. This
-    worker has no local session to prepare, so those are acknowledged as succeeded
-    and only `taskRun` actions do real work.
+    Deadline Cloud wraps a task in environment enter and exit actions, one pair per
+    queue environment, and may also assign a job attachments sync. Each kind is handled
+    on its own terms rather than acknowledged wholesale.
     """
     definition = action["definition"]
     session_action_id = action["sessionActionId"]
@@ -374,13 +421,61 @@ def _run_session_action(
     # time is recorded before any work begins.
     started_at = context.step(mark_action_started(session_action_id))
 
-    if "taskRun" not in definition:
-        # envEnter, envExit, or syncInputJobAttachments: nothing to do locally.
+    if "envEnter" in definition:
+        entered = context.step(
+            enter_queue_environment(
+                worker_id, job_id, definition["envEnter"]["environmentId"]
+            )
+        )
+        if "error" in entered:
+            # Failing stops the session, which surfaces the misconfiguration. Reporting
+            # success here would let the task run in an environment that was never
+            # prepared, which is the silent failure this replaced.
+            return {
+                "completedStatus": "FAILED",
+                "startedAt": started_at,
+                "endedAt": started_at,
+                "progressMessage": entered["error"][:4096],
+            }
         return {
             "completedStatus": "SUCCEEDED",
             "processExitCode": 0,
             "startedAt": started_at,
             "endedAt": started_at,
+        }
+
+    if "envExit" in definition:
+        # Nothing to tear down: entering an environment only collected variables, and a
+        # Lambda sandbox is discarded after the execution regardless.
+        return {
+            "completedStatus": "SUCCEEDED",
+            "processExitCode": 0,
+            "startedAt": started_at,
+            "endedAt": started_at,
+        }
+
+    if "syncInputJobAttachments" in definition:
+        # Job attachments stage files into a session directory, which this worker does
+        # not have. Succeeding would leave the task expecting inputs that never arrived.
+        return {
+            "completedStatus": "FAILED",
+            "startedAt": started_at,
+            "endedAt": started_at,
+            "progressMessage": (
+                "This worker does not support job attachments: it has no session "
+                "directory to stage input files into. Submit without job attachments, "
+                "or use a fleet whose workers have a filesystem."
+            ),
+        }
+
+    if "taskRun" not in definition:
+        # An action type this worker does not recognize. Reporting success for work that
+        # was never done is the worst option, so fail and say what happened.
+        return {
+            "completedStatus": "FAILED",
+            "startedAt": started_at,
+            "endedAt": started_at,
+            "progressMessage": f"Unsupported session action type: {sorted(definition)}",
         }
 
     task_parameters = definition["taskRun"].get("parameters", {})

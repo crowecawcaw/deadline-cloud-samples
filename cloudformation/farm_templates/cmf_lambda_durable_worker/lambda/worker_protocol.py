@@ -267,6 +267,40 @@ class DeadlineWorker:
                 f"Worker {self.worker_id} is no longer in the STARTED status"
             ) from exc
 
+    def get_environment_details(self, *, job_id: str, environment_id: str) -> dict[str, Any]:
+        """Fetch the Open Job Description template for a queue environment.
+
+        `BatchGetJobEntity` is how a worker retrieves the details behind the ids it is
+        given. This worker asks only for environment details; job attachments, step
+        templates, and job details are not needed because it does not run OpenJD
+        scripts or stage files.
+
+        Raises WorkerProtocolError if the service reports an error for the entity, so
+        the caller fails the action rather than proceeding without the environment.
+        """
+        client = self._client(use_worker_credentials=True)
+        response = client.batch_get_job_entity(
+            farmId=self.farm_id,
+            fleetId=self.fleet_id,
+            workerId=self.worker_id,
+            identifiers=[
+                {"environmentDetails": {"jobId": job_id, "environmentId": environment_id}}
+            ],
+        )
+        for error in response.get("errors", []):
+            details = error.get("environmentDetails")
+            if details:
+                raise WorkerProtocolError(
+                    f"Could not get environment {environment_id}: "
+                    f"{details['code']}: {details['message']}"
+                )
+        for entity in response.get("entities", []):
+            if "environmentDetails" in entity:
+                return entity["environmentDetails"]
+        raise WorkerProtocolError(
+            f"Environment {environment_id} was neither returned nor reported as an error"
+        )
+
     def delete_worker(self) -> None:
         """Deregister the worker. Safe to call when the worker is already gone."""
         client = self._client(use_worker_credentials=True)

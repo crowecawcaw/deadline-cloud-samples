@@ -18,7 +18,7 @@ durable steps are replaced with fakes, so no AWS call is made and no wait sleeps
 Why the steps are faked rather than mocked at the boto3 layer
 -------------------------------------------------------------
 `durable_step` is stubbed to the identity function, so a call such as
-`poll_schedule(worker_id, pending_updates)` in the handler binds its arguments as if the
+`poll_schedule(worker_id, updates)` in the handler binds its arguments as if the
 decorator had already supplied `step_context`. The real bodies cannot run under that
 stub, so each step is replaced by a fake with the handler's calling convention: the
 arguments the handler passes, and no `step_context`. `FakeDurableContext.step` then
@@ -285,17 +285,19 @@ class TestIdleBehavior(_WorkerLoopTestCase):
 class TestProgressReporting(_WorkerLoopTestCase):
     """UpdateWorkerSchedule is both the heartbeat and the progress report."""
 
-    def test_results_ride_out_on_the_following_poll(self):
+    def test_a_completed_action_is_reported_with_the_fields_the_service_requires(self):
         result, poll_calls, _, _ = self._run_loop(
             [
                 _poll_response(assignedSessions=_task_run_session()),
                 _poll_response(desiredWorkerStatus="STOPPED"),
             ]
         )
-        # The first poll carries nothing, because nothing has been done yet.
+        # A poll that asks for work carries no results, because nothing is done yet.
         self.assertEqual(poll_calls[0]["updates"], {})
-        # The second carries the finished action: one call, not a separate report.
-        update = poll_calls[1]["updates"]["sessionaction-1"]
+        # The result goes out in its own call as soon as the action finishes.
+        reported = [c for c in poll_calls if "sessionaction-1" in c["updates"]]
+        self.assertEqual(len(reported), 1)
+        update = reported[0]["updates"]["sessionaction-1"]
         self.assertEqual(update["completedStatus"], "SUCCEEDED")
         self.assertEqual(update["processExitCode"], 0)
         # startedAt is required by the service on every completed action.
@@ -305,7 +307,7 @@ class TestProgressReporting(_WorkerLoopTestCase):
 
     def test_a_reported_result_is_not_sent_twice(self):
         # The service treats a second completion for the same action as a protocol
-        # error, so pending results have to be cleared once they are handed over.
+        # error, so a result must not be resent on a later poll.
         _, poll_calls, _, _ = self._run_loop(
             [
                 _poll_response(assignedSessions=_task_run_session()),
@@ -314,8 +316,8 @@ class TestProgressReporting(_WorkerLoopTestCase):
             ],
             max_idle_polls=10,
         )
-        self.assertIn("sessionaction-1", poll_calls[1]["updates"])
-        self.assertEqual(poll_calls[2]["updates"], {})
+        carrying = [c for c in poll_calls if "sessionaction-1" in c["updates"]]
+        self.assertEqual(len(carrying), 1)
 
 
 class TestSubmitThrottleRetry(unittest.TestCase):
@@ -359,7 +361,7 @@ class TestSubmitThrottleRetry(unittest.TestCase):
         ):
             action = _task_run_session()["session-1"]["sessionActions"][0]
             result = durable_worker._run_session_action(
-                context=context, worker_id=WORKER_ID, action=action
+                context=context, worker_id=WORKER_ID, job_id="job-abc", action=action
             )
         return result, attempts, context.waits
 
@@ -439,7 +441,7 @@ class TestHeartbeatWhileWorking(unittest.TestCase):
         ):
             action = _task_run_session()["session-1"]["sessionActions"][0]
             result = durable_worker._run_session_action(
-                context=context, worker_id=WORKER_ID, action=action
+                context=context, worker_id=WORKER_ID, job_id="job-abc", action=action
             )
         return result, beats
 
@@ -487,6 +489,187 @@ class TestHeartbeatWhileWorking(unittest.TestCase):
         # No worker means no way to report a result, so the action is interrupted
         # rather than reported as succeeded or failed.
         self.assertEqual(result["completedStatus"], "INTERRUPTED")
+
+
+def _session_with(actions: list[dict]) -> dict:
+    """One assigned session holding the given already-summarized actions."""
+    return {"session-1": {"queueId": "queue-abc", "jobId": "job-abc", "sessionActions": actions}}
+
+
+def _action(action_id: str, definition: dict) -> dict:
+    return {"sessionActionId": action_id, "definition": definition}
+
+
+class TestSessionActionTypes(unittest.TestCase):
+    """Each action kind is handled on its own terms, not acknowledged wholesale."""
+
+    def _run(self, definition, *, entered=None):
+        context = FakeDurableContext()
+        with mock.patch.object(
+            durable_worker, "mark_action_started", lambda session_action_id: "T0"
+        ), mock.patch.object(
+            durable_worker,
+            "enter_queue_environment",
+            lambda worker_id, job_id, environment_id: entered or {"variables": {}},
+        ):
+            return durable_worker._run_session_action(
+                context=context,
+                worker_id=WORKER_ID,
+                job_id="job-abc",
+                action=_action("sessionaction-1", definition),
+            )
+
+    def test_an_environment_this_worker_can_honor_succeeds(self):
+        result = self._run({"envEnter": {"environmentId": "env-1"}})
+        self.assertEqual(result["completedStatus"], "SUCCEEDED")
+
+    def test_an_environment_it_cannot_honor_fails_the_action(self):
+        # Succeeding here would let the task run in an environment that was never
+        # prepared, which is exactly the silent failure this replaced.
+        result = self._run(
+            {"envEnter": {"environmentId": "env-1"}},
+            entered={"error": "defines a script, which a Lambda durable worker cannot run"},
+        )
+        self.assertEqual(result["completedStatus"], "FAILED")
+        self.assertIn("script", result["progressMessage"])
+
+    def test_env_exit_succeeds_because_there_is_nothing_to_tear_down(self):
+        result = self._run({"envExit": {"environmentId": "env-1"}})
+        self.assertEqual(result["completedStatus"], "SUCCEEDED")
+
+    def test_job_attachments_fail_rather_than_silently_staging_nothing(self):
+        # The task would otherwise run expecting input files that never arrived.
+        result = self._run({"syncInputJobAttachments": {"stepId": "step-1"}})
+        self.assertEqual(result["completedStatus"], "FAILED")
+        self.assertIn("job attachments", result["progressMessage"])
+
+    def test_an_unknown_action_type_fails_rather_than_reporting_success(self):
+        result = self._run({"somethingNew": {}})
+        self.assertEqual(result["completedStatus"], "FAILED")
+        self.assertIn("Unsupported", result["progressMessage"])
+
+
+class TestFailedActionStopsTheSession(unittest.TestCase):
+    """One unsuccessful action stops the rest of its session.
+
+    The service will not run further taskRun, envEnter, or syncInputJobAttachments
+    actions in a session once any action in it has failed, so continuing would submit
+    Bedrock requests whose results are discarded. envExit still runs, because it is the
+    session's cleanup.
+    """
+
+    def _run(self, actions, *, results):
+        calls = []
+
+        def fake_run(*, context, worker_id, job_id, action):
+            calls.append(action["sessionActionId"])
+            return results[action["sessionActionId"]]
+
+        # Each result is now reported in its own UpdateWorkerSchedule call, because the
+        # service rejects out-of-order batches. Collect what each call carried so the
+        # tests can assert on the reported results.
+        reported: dict = {}
+
+        def fake_poll_schedule(worker_id, updates):
+            reported.update(updates)
+            return _poll_response()
+
+        with mock.patch.object(
+            durable_worker, "_run_session_action", fake_run
+        ), mock.patch.object(durable_worker, "poll_schedule", fake_poll_schedule):
+            succeeded = durable_worker._finish_assigned_work(
+                context=FakeDurableContext(),
+                worker_id=WORKER_ID,
+                poll=_poll_response(assignedSessions=_session_with(actions)),
+            )
+        return succeeded, calls, reported
+
+    def test_a_failure_marks_later_actions_never_attempted(self):
+        actions = [
+            _action("a1", {"envEnter": {"environmentId": "env-1"}}),
+            _action("a2", {"taskRun": {"taskId": "t", "stepId": "s", "parameters": {}}}),
+            _action("a3", {"taskRun": {"taskId": "t2", "stepId": "s", "parameters": {}}}),
+        ]
+        succeeded, calls, pending = self._run(
+            actions,
+            results={"a1": {"completedStatus": "FAILED", "startedAt": "T0", "endedAt": "T1"}},
+        )
+        # The two taskRuns are never attempted, so no Bedrock request is paid for.
+        self.assertEqual(calls, ["a1"])
+        self.assertEqual(succeeded, 0)
+        self.assertEqual(pending["a2"]["completedStatus"], "NEVER_ATTEMPTED")
+        self.assertEqual(pending["a3"]["completedStatus"], "NEVER_ATTEMPTED")
+
+    def test_never_attempted_carries_no_timestamps(self):
+        actions = [
+            _action("a1", {"taskRun": {"taskId": "t", "stepId": "s", "parameters": {}}}),
+            _action("a2", {"taskRun": {"taskId": "t2", "stepId": "s", "parameters": {}}}),
+        ]
+        _, _, pending = self._run(
+            actions,
+            results={"a1": {"completedStatus": "FAILED", "startedAt": "T0", "endedAt": "T1"}},
+        )
+        # The service rejects a NEVER_ATTEMPTED report that claims to have run.
+        self.assertNotIn("startedAt", pending["a2"])
+        self.assertNotIn("endedAt", pending["a2"])
+
+    def test_env_exit_still_runs_after_a_failure(self):
+        actions = [
+            _action("a1", {"taskRun": {"taskId": "t", "stepId": "s", "parameters": {}}}),
+            _action("a2", {"envExit": {"environmentId": "env-1"}}),
+        ]
+        _, calls, pending = self._run(
+            actions,
+            results={
+                "a1": {"completedStatus": "FAILED", "startedAt": "T0", "endedAt": "T1"},
+                "a2": {"completedStatus": "SUCCEEDED", "startedAt": "T1", "endedAt": "T2"},
+            },
+        )
+        # Cleanup has to happen even on the failure path.
+        self.assertEqual(calls, ["a1", "a2"])
+        self.assertEqual(pending["a2"]["completedStatus"], "SUCCEEDED")
+
+    def test_each_result_is_reported_separately_and_in_order(self):
+        # The service enforces the assigned order and rejects the whole request if a
+        # later action is reported first: "comes in a wrong order". Batching results
+        # therefore loses every result in the batch, not just the out-of-order one.
+        actions = [
+            _action("a0", {"envEnter": {"environmentId": "env-1"}}),
+            _action("a1", {"taskRun": {"taskId": "t", "stepId": "s", "parameters": {}}}),
+        ]
+        batches = []
+
+        def fake_poll_schedule(worker_id, updates):
+            batches.append(sorted(updates))
+            return _poll_response()
+
+        with mock.patch.object(
+            durable_worker,
+            "_run_session_action",
+            lambda **kw: {"completedStatus": "SUCCEEDED"},
+        ), mock.patch.object(durable_worker, "poll_schedule", fake_poll_schedule):
+            durable_worker._finish_assigned_work(
+                context=FakeDurableContext(),
+                worker_id=WORKER_ID,
+                poll=_poll_response(assignedSessions=_session_with(actions)),
+            )
+        # One call per action, each carrying only its own result, in assigned order.
+        self.assertEqual(batches, [["a0"], ["a1"]])
+
+    def test_all_actions_run_when_none_fail(self):
+        actions = [
+            _action("a1", {"taskRun": {"taskId": "t", "stepId": "s", "parameters": {}}}),
+            _action("a2", {"taskRun": {"taskId": "t2", "stepId": "s", "parameters": {}}}),
+        ]
+        succeeded, calls, _ = self._run(
+            actions,
+            results={
+                "a1": {"completedStatus": "SUCCEEDED"},
+                "a2": {"completedStatus": "SUCCEEDED"},
+            },
+        )
+        self.assertEqual(calls, ["a1", "a2"])
+        self.assertEqual(succeeded, 2)
 
 
 if __name__ == "__main__":

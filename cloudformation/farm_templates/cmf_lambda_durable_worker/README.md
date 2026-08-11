@@ -109,6 +109,24 @@ the request for work), act on whatever comes back, and sleep for the interval th
 service asks for. When it receives a task it starts a Bedrock request, sleeps between
 status checks, and reports the result on its next heartbeat.
 
+### Reporting results
+
+Two rules govern how results go back, and both are enforced by the service rather than
+merely recommended.
+
+**One result per call, in the assigned order.** Reporting action 1 before action 0 is
+rejected with "comes in a wrong order", and because the rejection fails the whole request,
+batching results loses every result in the batch rather than just the offending one. So
+each action's result is sent in its own `UpdateWorkerSchedule` call as soon as it
+completes.
+
+**One failure stops the rest of its session.** The service will not run further `taskRun`,
+`envEnter`, or `syncInputJobAttachments` actions in a session once any action in it has
+failed, been canceled, or been interrupted. The remaining actions are reported
+`NEVER_ATTEMPTED`, with no timestamps, because they never started. `envExit` still runs: it
+is the session's cleanup and has to happen on the failure path too. Ignoring this rule
+means paying Bedrock for requests whose results the service discards.
+
 ### Heartbeating while busy
 
 A worker must keep calling `UpdateWorkerSchedule` even while it is working. Stop, and the
@@ -138,14 +156,38 @@ The tradeoff is real: you give up job attachments, session log streaming, host
 configuration scripts, and running jobs as a specific user. That is why the job template
 here describes an API call rather than a command to execute.
 
-Two consequences deserve to be stated plainly, because both fail quietly rather than
-loudly. **Queue environments are not run.** Deadline Cloud assigns `envEnter` and
-`envExit` actions around a task, and this worker acknowledges them as succeeded without
-doing anything, because it has no local session to prepare. That is safe only while the
-task needs nothing from the environment, which holds here since the task is an API call.
-Attach a Conda queue environment to this queue and it becomes a silent no-op. **Job
-parameters do not reach the worker**, only task parameters do; job-level parameters
-require `BatchGetJobEntity`, which this sample does not implement.
+**Job parameters do not reach the worker**, only task parameters do. Job-level parameters
+arrive via `BatchGetJobEntity`'s `jobDetails`, which this sample does not fetch, so a job
+parameter would silently fall back to the function's default. The accompanying job bundle
+therefore puts everything in the step's `parameterSpace`.
+
+### Queue environments
+
+Deadline Cloud wraps a task in `envEnter` and `envExit` actions, one pair per queue
+environment. The worker fetches each environment's Open Job Description template with
+`BatchGetJobEntity` and then does what it can with it:
+
+* An environment that only defines **`variables`** is applied, and the variables are
+  available to the task. This covers environments that pass configuration.
+* An environment that defines a **`script`** fails the `envEnter` action with an
+  explanation naming the environment.
+
+Failing is deliberate. Every environment in
+[`queue_environments/`](../../../queue_environments/) is script-based, because their job
+is to install software onto a host: a Lambda worker has no persistent session directory,
+no writable filesystem outside `/tmp`, and none of the tools those scripts drive. The
+alternative to failing is reporting success for setup that never happened and letting the
+task run in an environment that was never prepared.
+
+One operational consequence to know about: a failed `envEnter` is retried, so a queue with
+a scripted environment and only these workers will cycle through sessions until the job's
+retry limits are exhausted rather than failing once. The message on the failed action says
+which environment is responsible. Either remove that environment from the queue, or run
+those jobs on a fleet whose workers execute scripts.
+
+**Job attachments are also unsupported**, and fail for the same reason: there is no
+session directory to stage input files into. Succeeding would let a task run expecting
+inputs that never arrived.
 
 ### Writing for replay
 
@@ -323,6 +365,7 @@ it and the artifacts bucket by hand when you no longer need them.
 | [`lambda/worker_protocol.py`](lambda/worker_protocol.py) | Deadline Cloud worker protocol client |
 | [`lambda/bedrock_task.py`](lambda/bedrock_task.py) | Maps task parameters to async Bedrock requests |
 | [`lambda/scaling_handler.py`](lambda/scaling_handler.py) | Turns scaling events into worker executions |
+| [`lambda/queue_environment.py`](lambda/queue_environment.py) | Applies a queue environment's variables, refuses its scripts |
 | [`lambda/worker_registry.py`](lambda/worker_registry.py) | Live-worker registry and drain flag |
 | [`tests/`](tests/) | Unit tests: data transformations, scaling arithmetic, registry, and worker loop exit paths |
 
