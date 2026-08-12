@@ -46,8 +46,8 @@ if [[ -n "$MODEL_ID" ]]; then
   echo "==> Checking whether ${MODEL_ID} is available in ${REGION}"
   if ! aws bedrock list-foundation-models --region "$REGION" \
         --query "modelSummaries[?modelId=='${MODEL_ID}'].modelId" --output text | grep -q .; then
-    echo "warning: model ${MODEL_ID} is not available in ${REGION}. Jobs naming it in a" >&2
-    echo "         bedrock-async Request will fail. List async-capable candidates with:" >&2
+    echo "warning: model ${MODEL_ID} is not available in ${REGION}. Jobs passing it as" >&2
+    echo "         their ModelId job parameter will fail. List async-capable candidates:" >&2
     echo "         aws bedrock list-foundation-models --region ${REGION} \\" >&2
     echo "           --query \"modelSummaries[?contains(outputModalities,'VIDEO')].modelId\"" >&2
   fi
@@ -56,15 +56,24 @@ fi
 echo "==> Building the deployment package"
 cp "$SCRIPT_DIR"/lambda/*.py "$BUILD_DIR/"
 cp -R "$SCRIPT_DIR"/lambda/providers "$BUILD_DIR/"
-find "$BUILD_DIR/providers" -name '__pycache__' -type d -prune -exec rm -rf {} +
-# Bundle the durable execution SDK rather than relying on the copy in the runtime, so a
-# runtime update cannot change the behavior of in-flight executions.
+# Wheels are fetched for the Lambda runtime rather than for this machine, and everything
+# lands flat next to the handler modules, which is where the runtime looks first.
+#
+# The durable execution SDK is bundled rather than taken from the runtime so that a runtime
+# update cannot change the behavior of in-flight executions. openjd-sessions is what runs
+# the session actions, and openjd-model with pydantic are what it parses templates with;
+# none of the three is in the runtime.
 python3 -m pip install \
   --quiet --target "$BUILD_DIR" \
   --only-binary :all: --platform manylinux2014_x86_64 \
   --python-version 3.14 --implementation cp \
-  'aws-durable-execution-sdk-python<2'
-(cd "$BUILD_DIR" && zip -qr lambda.zip . -x 'lambda.zip')
+  'aws-durable-execution-sdk-python<2' \
+  'openjd-sessions<1' \
+  'openjd-model<1' \
+  'pydantic<3'
+(cd "$BUILD_DIR" && find . -name '__pycache__' -type d -prune -exec rm -rf {} + \
+  && zip -qr lambda.zip . -x 'lambda.zip')
+echo "    package: $(du -h "$BUILD_DIR/lambda.zip" | cut -f1) zipped"
 
 echo "==> Staging the package in s3://${ARTIFACT_BUCKET}"
 if ! aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" --region "$REGION" 2>/dev/null; then

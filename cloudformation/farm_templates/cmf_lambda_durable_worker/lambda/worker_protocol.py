@@ -3,13 +3,15 @@
 
 `deadline-cloud-worker-agent` assumes a long-lived process on a host it owns, so this
 implements the wire protocol directly instead: CreateWorker, AssumeFleetRoleForWorker,
-UpdateWorker, UpdateWorkerSchedule, BatchGetJobEntity, DeleteWorker. Every method is a
-plain request/response call, which leaves callers free to wrap each one in a durable step.
+AssumeQueueRoleForWorker, UpdateWorker, UpdateWorkerSchedule, BatchGetJobEntity,
+DeleteWorker. Every method is a plain request/response call, which leaves callers free to
+wrap each one in a durable step.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import boto3
@@ -18,6 +20,10 @@ from botocore.config import Config
 from botocore.credentials import RefreshableCredentials
 
 logger = logging.getLogger(__name__)
+
+# The session directory lives in /tmp, whose size Lambda configures separately from memory
+# and does not report to the function.
+SCRATCH_MIB = int(os.environ.get("EPHEMERAL_STORAGE_MIB", "512"))
 
 # Few attempts on purpose: botocore's backoff sleeps inside the call, and in Lambda that
 # sleep is billed compute. Long backoff belongs behind a durable wait, which is unbilled.
@@ -199,34 +205,82 @@ class DeadlineWorker:
                 f"Worker {self.worker_id} is no longer in the STARTED status"
             ) from exc
 
-    def get_environment_details(self, *, job_id: str, environment_id: str) -> dict[str, Any]:
-        """Fetch the Open Job Description template for a queue environment.
+    def assume_queue_role(self, *, queue_id: str) -> dict[str, Any]:
+        """Obtain the queue role credentials a job's own scripts run with.
 
-        Only environment details are requested: this worker runs no OpenJD scripts and
-        stages no files, so it needs neither job details nor step templates.
+        This is how a real worker keeps a task's code off the worker's own identity. Not
+        checkpointed: these are shorter-lived than a durable execution.
         """
         client = self._client(use_worker_credentials=True)
+        try:
+            response = client.assume_queue_role_for_worker(
+                farmId=self.farm_id,
+                fleetId=self.fleet_id,
+                workerId=self.worker_id,
+                queueId=queue_id,
+            )
+        except client.exceptions.ResourceNotFoundException as exc:
+            raise WorkerDeletedError(f"Worker {self.worker_id} no longer exists") from exc
+        return response["credentials"]
+
+    def get_job_entities(self, *, identifiers: list[dict[str, Any]]) -> dict[str, Any]:
+        """Fetch job, step, and environment entities in one call, keyed by their kind.
+
+        One call rather than several because each is a round trip inside a billed
+        invocation, and the identifiers a single action needs always fit the API's limit.
+        """
+        client = self._client(use_worker_credentials=True)
+        limit = _max_identifiers(client)
+        if not 1 <= len(identifiers) <= limit:
+            raise WorkerProtocolError(
+                f"BatchGetJobEntity accepts 1 to {limit} identifiers, got {len(identifiers)}"
+            )
+
+        entities, errors = self._batch_get_job_entity(client, identifiers)
+        for kind, error in errors.items():
+            if error["code"] != "MaxPayloadSizeExceeded":
+                raise WorkerProtocolError(
+                    f"Could not get {kind}: {error['code']}: {error['message']}"
+                )
+            # A step whose template carries large embedded files does not fit in a response
+            # alongside anything else, so ask for that one entity on its own.
+            alone, alone_errors = self._batch_get_job_entity(
+                client, [i for i in identifiers if kind in i]
+            )
+            if alone_errors:
+                raise WorkerProtocolError(
+                    f"Could not get {kind} even on its own: "
+                    f"{alone_errors[kind]['code']}: {alone_errors[kind]['message']}"
+                )
+            entities.update(alone)
+
+        missing = {kind for identifier in identifiers for kind in identifier} - set(entities)
+        if missing:
+            raise WorkerProtocolError(
+                f"{', '.join(sorted(missing))} was neither returned nor reported as an error"
+            )
+        return entities
+
+    def _batch_get_job_entity(
+        self, client: Any, identifiers: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         response = client.batch_get_job_entity(
             farmId=self.farm_id,
             fleetId=self.fleet_id,
             workerId=self.worker_id,
-            identifiers=[
-                {"environmentDetails": {"jobId": job_id, "environmentId": environment_id}}
-            ],
+            identifiers=identifiers,
         )
-        for error in response.get("errors", []):
-            details = error.get("environmentDetails")
-            if details:
-                raise WorkerProtocolError(
-                    f"Could not get environment {environment_id}: "
-                    f"{details['code']}: {details['message']}"
-                )
-        for entity in response.get("entities", []):
-            if "environmentDetails" in entity:
-                return entity["environmentDetails"]
-        raise WorkerProtocolError(
-            f"Environment {environment_id} was neither returned nor reported as an error"
-        )
+        entities = {
+            kind: entity
+            for wrapper in response.get("entities", [])
+            for kind, entity in wrapper.items()
+        }
+        errors = {
+            kind: error
+            for wrapper in response.get("errors", [])
+            for kind, error in wrapper.items()
+        }
+        return entities, errors
 
     def delete_worker(self) -> None:
         """Deregister the worker. Safe to call when the worker is already gone."""
@@ -240,6 +294,40 @@ class DeadlineWorker:
             logger.info("Worker %s was already deleted", self.worker_id)
 
 
+def _max_identifiers(client: Any) -> int:
+    """Read BatchGetJobEntity's identifier limit from the model rather than assuming it."""
+    shape = client.meta.service_model.operation_model("BatchGetJobEntity").input_shape
+    return int(shape.members["identifiers"].metadata["max"])
+
+
+# Deadline Cloud tags each parameter with its type. `chunkInt` exists only on task
+# parameters, so a job parameter carrying one is a wire-format error rather than a value.
+JOB_PARAMETER_TYPES = {"string": "STRING", "int": "INT", "float": "FLOAT", "path": "PATH"}
+TASK_PARAMETER_TYPES = {**JOB_PARAMETER_TYPES, "chunkInt": "CHUNK[INT]"}
+
+
+def unwrap_parameters(
+    tagged_values: dict[str, dict[str, str]], *, task: bool
+) -> dict[str, dict[str, str]]:
+    """Restate tagged parameters in Open Job Description's own spelling of the types.
+
+    Plain JSON, so the result can cross a checkpoint boundary on its way to a session.
+    """
+    types = TASK_PARAMETER_TYPES if task else JOB_PARAMETER_TYPES
+    parameters = {}
+    for name, tagged_value in (tagged_values or {}).items():
+        for tag, value_type in types.items():
+            if tag in tagged_value:
+                parameters[name] = {"type": value_type, "value": str(tagged_value[tag])}
+                break
+        else:
+            raise WorkerProtocolError(
+                f"Parameter {name} has no value this worker recognizes: "
+                f"{sorted(tagged_value)}"
+            )
+    return parameters
+
+
 def _as_iso(expiration: Any) -> str:
     """Accept an expiry as either a datetime or an ISO-8601 string."""
     return expiration if isinstance(expiration, str) else expiration.isoformat()
@@ -248,14 +336,17 @@ def _as_iso(expiration: Any) -> str:
 def default_capabilities() -> dict[str, Any]:
     """Capabilities describing a Lambda-hosted worker.
 
-    The amounts are modest because this worker forwards API calls. What matters is the
-    custom `attr.durable.lambda` attribute that job templates target.
+    Read from the runtime's own settings so a host requirement is judged against what the
+    function was actually given. What matters most is the custom `attr.durable.lambda`
+    attribute that job templates target.
     """
+    memory_mib = int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1769"))
     return {
         "amounts": [
-            {"name": "amount.worker.vcpu", "value": 1},
-            {"name": "amount.worker.memory", "value": 2048},
-            {"name": "amount.worker.disk.scratch", "value": 0},
+            # Lambda gives a function one vCPU per 1769 MB, and nothing exposes the number.
+            {"name": "amount.worker.vcpu", "value": max(1, memory_mib // 1769)},
+            {"name": "amount.worker.memory", "value": memory_mib},
+            {"name": "amount.worker.disk.scratch", "value": SCRATCH_MIB},
             {"name": "amount.worker.gpu", "value": 0},
         ],
         "attributes": [

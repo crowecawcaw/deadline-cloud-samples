@@ -1,73 +1,124 @@
 specificationVersion: 'jobtemplate-2023-09'
 name: Bedrock Generation Fanout
 
-# One task per clip. Each task names a provider and carries that provider's request body
-# verbatim, so switching model, settings, or service is a template edit and never a worker
-# code change. The durable Lambda workers in the customer-managed fleet dispatch the
-# request and suspend, unbilled, until it finishes.
+# One task per prompt. Each task's onRun starts an asynchronous Bedrock invocation itself and
+# then hands the waiting to the worker by printing a `durable_lambda_await:` line. The durable
+# Lambda workers in the customer-managed fleet suspend, unbilled, until the invocation
+# finishes, and report the task's result from its outcome.
 #
-# Everything is a TASK parameter, never a job parameter. A worker receives task parameters
-# directly in the `taskRun` session action, whereas job parameters have to be fetched with
-# `BatchGetJobEntity`, which this worker deliberately does not do: a job parameter would
-# silently never reach it.
+# Open Job Description has no notion of an action that suspends, so that line is a worker-side
+# extension. It is deliberately not spelled with an `openjd_` prefix, which belongs to the
+# specification.
+
+parameterDefinitions:
+- name: OutputBucket
+  type: STRING
+  description: >-
+    S3 bucket Bedrock writes generated output to. Use the OutputBucketName output of the
+    cmf_lambda_durable_worker stack.
+- name: OutputPrefix
+  type: STRING
+  default: generated
+  description: >-
+    Key prefix under OutputBucket. The fleet stack expires this prefix after seven days, so
+    changing it also means changing that lifecycle rule.
+- name: ModelId
+  type: STRING
+  default: luma.ray-v2:0
+  description: >-
+    A Bedrock model that supports StartAsyncInvoke, which in practice means the video
+    generation models. Image models such as Amazon Nova Canvas are synchronous only and
+    expose nothing to poll.
+- name: Duration
+  type: STRING
+  default: "5s"
+  description: Clip length, in whatever spelling the chosen model documents.
+- name: Resolution
+  type: STRING
+  default: 540p
+  description: Output resolution, in whatever spelling the chosen model documents.
+- name: AspectRatio
+  type: STRING
+  default: "16:9"
+  description: Output aspect ratio, in whatever spelling the chosen model documents.
 
 steps:
 - name: Generate
   parameterSpace:
     taskParameterDefinitions:
-    # Single-valued, so it does not fan out. `sleep` is the credential-free provider, and
-    # a worker rejects any name it does not know with a message listing the ones it does.
-    - name: Provider
-      type: STRING
-      range: ["bedrock-async"]
-    # The fan-out parameter. `modelId` and `modelInput` reach StartAsyncInvoke untouched,
-    # so `modelInput` follows whatever schema the chosen model documents. Asynchronous
-    # invocation is the video generation models; image models such as Nova Canvas are
-    # synchronous only and cannot be polled.
-    #
-    # `modelId` comes last so the JSON never contains `}}`, which Open Job Description
-    # reads as the end of an interpolation expression. Separate any other adjacent closing
-    # braces with a space.
-    - name: Request
+    # The only task parameter, so the parameter space is one task per prompt. Everything else
+    # is a job parameter: task parameters form a cross product, so a second one would
+    # multiply the task count rather than change a setting.
+    - name: Prompt
       type: STRING
       range:
-      - >-
-        {"modelInput": {"prompt": "a red sports car driving along a coastal highway at
-        sunset, cinematic",
-        "duration": "5s", "resolution": "540p", "aspect_ratio": "16:9", "loop": false},
-        "modelId": "luma.ray-v2:0"}
-      - >-
-        {"modelInput": {"prompt": "a slow aerial push over a misty pine forest at dawn",
-        "duration": "5s", "resolution": "540p", "aspect_ratio": "16:9", "loop": false},
-        "modelId": "luma.ray-v2:0"}
-      - >-
-        {"modelInput": {"prompt": "timelapse of storm clouds gathering over a desert mesa",
-        "duration": "5s", "resolution": "540p", "aspect_ratio": "16:9", "loop": false},
-        "modelId": "luma.ray-v2:0"}
+      - a red sports car driving along a coastal highway at sunset, cinematic
+      - a slow aerial push over a misty pine forest at dawn
+      - timelapse of storm clouds gathering over a desert mesa
   hostRequirements:
     attributes:
       # Restrict these tasks to the durable Lambda workers, which report this attribute in
-      # their capabilities. Without it a conventional worker could be assigned a step it
-      # has no way to run.
+      # their capabilities. Without it a conventional worker could be assigned a step whose
+      # await line nothing would act on. The fleet must declare the attribute too.
       - name: attr.durable.lambda
         anyOf: ["true"]
   script:
     actions:
       onRun:
-        # A durable Lambda worker never runs this; it reads the task parameters instead.
-        # Keeping the action meaningful means `openjd run` and a conventional worker both
-        # show exactly which request would have been dispatched.
-        command: bash
-        args: ["{{Task.File.Report}}"]
+        # python3 with boto3, not the AWS CLI: the CLI is not in the Lambda Python runtime,
+        # and the worker puts the interpreter's own directory on PATH.
+        command: python3
+        args: ["{{Task.File.Submit}}"]
     embeddedFiles:
-    # The request is its own file so that no shell quoting can mangle the JSON.
-    - name: RequestBody
+    # The prompt travels as a file so that no shell or Python quoting can mangle it.
+    - name: Prompt
       type: TEXT
       data: |
-        {{Task.Param.Request}}
-    - name: Report
+        {{Task.Param.Prompt}}
+    - name: Submit
       type: TEXT
       data: |
-        echo "provider: {{Task.Param.Provider}}"
-        echo "request:"
-        cat "{{Task.File.RequestBody}}"
+        """Start one asynchronous Bedrock invocation and hand the wait to the worker."""
+        import hashlib
+        import json
+
+        import boto3
+
+        with open("{{Task.File.Prompt}}") as prompt_file:
+            prompt = prompt_file.read().strip()
+
+        # Nested dictionaries are built one at a time on purpose: two adjacent closing braces
+        # anywhere in this file would end an Open Job Description interpolation expression and
+        # make the template invalid.
+        model_input = {
+            "prompt": prompt,
+            "duration": "{{Param.Duration}}",
+            "resolution": "{{Param.Resolution}}",
+            "aspect_ratio": "{{Param.AspectRatio}}",
+            "loop": False,
+        }
+        # Derived from the prompt so concurrent tasks cannot collide in S3 and a retried task
+        # writes to the same place.
+        task_key = hashlib.sha256(prompt.encode()).hexdigest()[:16]
+        s3_config = {"s3Uri": "s3://{{Param.OutputBucket}}/{{Param.OutputPrefix}}/" + task_key}
+        output_config = {"s3OutputDataConfig": s3_config}
+
+        print("openjd_status: Starting {{Param.ModelId}} invocation", flush=True)
+        client = boto3.client("bedrock-runtime")
+        try:
+            response = client.start_async_invoke(
+                modelId="{{Param.ModelId}}",
+                modelInput=model_input,
+                outputDataConfig=output_config,
+            )
+        except Exception as error:
+            # These credentials are the queue role's, so a denial points there rather than at
+            # the worker's own execution role.
+            print("openjd_fail: StartAsyncInvoke failed: " + str(error), flush=True)
+            raise SystemExit(1)
+
+        # Everything above ran in one billed invocation. This line is what makes the waiting
+        # free: the worker checkpoints the handle, suspends, and polls the provider until the
+        # invocation reaches a terminal state.
+        await_token = {"provider": "bedrock-async", "handle": response["invocationArn"]}
+        print("durable_lambda_await: " + json.dumps(await_token), flush=True)

@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >-
   A Deadline Cloud customer-managed fleet whose workers are Lambda durable functions.
-  Workers register with the fleet, heartbeat, dispatch the long-running API request a
-  task describes, and suspend without compute charges while that request runs.
+  Workers register with the fleet, heartbeat, run Open Job Description session actions with
+  openjd-sessions, and suspend without compute charges while a long-running request that a
+  task handed over runs to completion.
 
 Parameters:
   FarmId:
@@ -28,9 +29,18 @@ Parameters:
     MinValue: 5
     MaxValue: 900
     Description: >-
-      Seconds a worker sleeps between checks on an in-flight task request. The execution
+      Seconds a worker sleeps between checks on a request a task handed over. The execution
       is suspended for this whole interval, so a longer value costs nothing and only
       delays noticing completion.
+  EphemeralStorageMiB:
+    Type: Number
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+    Description: >-
+      Size of /tmp, which holds the Open Job Description session directory that embedded
+      files and task output are written into. Workers report this as
+      amount.worker.disk.scratch.
   LambdaCodeBucket:
     Type: String
     Description: >-
@@ -92,10 +102,21 @@ Resources:
               # actions, both authorize against the worker resource, so the ARNs end in
               # `/worker/*`.
               #
-              # Fetches a queue environment's template when an envEnter action arrives.
+              # Fetches the job's parameters and path mapping rules, and the step or
+              # environment template of whichever action is about to run.
               - Effect: Allow
                 Action: deadline:BatchGetJobEntity
                 Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
+              # A task's own script runs with the queue role, not with the worker's
+              # identity. The managed policy above is expected to cover this action
+              # already; granting it explicitly costs nothing and removes the doubt.
+              # Both resources are named because the request identifies a worker and a
+              # queue, and which of the two it authorizes against is not documented.
+              - Effect: Allow
+                Action: deadline:AssumeQueueRoleForWorker
+                Resource:
+                  - !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/queue/*
+                  - !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
               # A worker deregisters itself when it drains. The managed fleet-worker
               # policy covers UpdateWorker but not DeleteWorker, so without this a
               # drained worker would linger in the fleet and keep occupying capacity
@@ -156,7 +177,7 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          # Matches the bedrock-async provider's OUTPUT_PREFIX default.
+          # Matches the prefix the bedrock_generation_fanout bundle's script writes under.
           - Id: ExpireGeneratedOutput
             Status: Enabled
             Prefix: generated/
@@ -217,31 +238,47 @@ Resources:
                   - deadline:CreateWorker
                   - deadline:AssumeFleetRoleForWorker
                 Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/${DurableFleet.FleetId}/worker/*
-              # For the bedrock-async provider. StartAsyncInvoke additionally requires
-              # bedrock:InvokeModel: the async-invoke call is authorized as a model
-              # invocation, and without InvokeModel it fails with AccessDenied on the
-              # async-invoke resource. Both resources are named so this grant does not
-              # extend to other Bedrock usage in the account. A new provider brings its
-              # own grants here.
+              # GetAsyncInvoke only. The worker awaits a request the task's own script
+              # started, and it polls with its own identity because the queue credentials
+              # the script used are long gone by then. Every other Bedrock grant belongs to
+              # the queue role, in QueueGenerationPolicy below.
               - Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                  - bedrock:StartAsyncInvoke
-                  - bedrock:GetAsyncInvoke
-                Resource:
-                  - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*
-                  - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
-              # Write only: Bedrock writes the generated output with these credentials,
-              # and nothing in this sample reads it back.
-              - Effect: Allow
-                Action: s3:PutObject
-                Resource: !Sub ${OutputBucket.Arn}/*
+                Action: bedrock:GetAsyncInvoke
+                Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:GetItem
                   - dynamodb:DeleteItem
                 Resource: !GetAtt WorkerRegistryTable.Arn
+
+  # Attach this to the role of every queue whose jobs run on this fleet. It cannot be
+  # attached here: the queue and its role belong to the farm, not to this stack. Job scripts
+  # run with the queue role, so these are the grants the bedrock_generation_fanout bundle
+  # needs, and a different job brings its own.
+  QueueGenerationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Grants a Deadline Cloud queue role the Bedrock and S3 access this sample's jobs use.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # StartAsyncInvoke additionally requires bedrock:InvokeModel: the async-invoke call
+          # is authorized as a model invocation, and without InvokeModel it fails with
+          # AccessDenied on the async-invoke resource.
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:StartAsyncInvoke
+              - bedrock:GetAsyncInvoke
+            Resource:
+              - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*
+              - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
+          # Write only: Bedrock writes the generated output with these credentials, and
+          # nothing in this sample reads it back.
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub ${OutputBucket.Arn}/*
 
   WorkerFunction:
     Type: AWS::Lambda::Function
@@ -250,10 +287,16 @@ Resources:
       Runtime: python3.14
       Handler: durable_worker.lambda_handler
       Role: !GetAtt WorkerFunctionRole.Arn
-      # Per-invocation timeout. A durable execution spans many invocations, so this
-      # bounds one wake-up, not the worker's lifetime.
+      # Per-invocation timeout, which now has to fit one whole session action: an action can
+      # never span a suspension. A durable execution spans many invocations, so this bounds
+      # one wake-up, not the worker's lifetime.
       Timeout: 300
-      MemorySize: 512
+      # 1769 MB is exactly one vCPU, and the worker now forks real subprocesses instead of
+      # only making API calls.
+      MemorySize: 1769
+      EphemeralStorage:
+        # Holds the session directory that embedded files and task output are written into.
+        Size: !Ref EphemeralStorageMiB
       DurableConfig:
         # Total lifetime of one worker execution. Can only be set at creation:
         # durable execution cannot be enabled on an existing function.
@@ -263,14 +306,20 @@ Resources:
         Variables:
           FARM_ID: !Ref FarmId
           FLEET_ID: !GetAtt DurableFleet.FleetId
-          OUTPUT_BUCKET: !Ref OutputBucket
           REGISTRY_TABLE: !Ref WorkerRegistryTable
-          # The whole retry and poll policy. Every wait behind these suspends the
-          # execution, so patience is free; only the notice delay grows.
+          # Reported as amount.worker.disk.scratch: nothing in the runtime exposes the
+          # configured size of /tmp.
+          EPHEMERAL_STORAGE_MIB: !Ref EphemeralStorageMiB
+          # Session actions run here rather than under tempfile.gettempdir(), so the
+          # location does not depend on what the runtime resolves that to.
+          SESSION_ROOT: /tmp/openjd
+          # Must stay below the function Timeout above, with room to cancel and reap.
+          ACTION_TIMEOUT_SECONDS: "240"
+          CANCEL_GRACE_SECONDS: "20"
+          # The whole poll policy. Every wait behind these suspends the execution, so
+          # patience is free; only the notice delay grows.
           TASK_POLL_SECONDS: !Ref TaskPollSeconds
           MAX_TASK_POLLS: "120"
-          SUBMIT_RETRY_SECONDS: "60"
-          MAX_SUBMIT_ATTEMPTS: "10"
           MAX_IDLE_POLLS: "20"
           MAX_LOOP_ITERATIONS: "2000"
       Code:
@@ -427,9 +476,14 @@ Outputs:
     Value: !Ref ScalingFunction
   OutputBucketName:
     Description: >-
-      Bucket the bedrock-async provider writes generated output to. Retained on stack
-      delete.
+      Bucket for generated output, retained on stack delete. Pass it as the OutputBucket job
+      parameter; the job's own script is what writes there.
     Value: !Ref OutputBucket
+  QueueGenerationPolicyArn:
+    Description: >-
+      Attach this to the role of every queue whose jobs run on this fleet. Job scripts run
+      with the queue role, so without it StartAsyncInvoke fails with AccessDenied.
+    Value: !Ref QueueGenerationPolicy
   WorkerRegistryTableName:
     Description: Registry of live durable workers.
     Value: !Ref WorkerRegistryTable

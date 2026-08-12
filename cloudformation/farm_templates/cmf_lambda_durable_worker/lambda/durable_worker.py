@@ -4,11 +4,14 @@
 Replay contract: everything non-deterministic or side-effecting happens inside a
 `context.step()`, control flow depends only on step results, and step identity is
 positional, so a step that repeats must vary its arguments to earn its own checkpoint.
+
+One invocation runs exactly one Open Job Description session action, start to finish. An
+action can never span a `context.wait()`, so the unbilled waiting happens only between
+actions, or while awaiting the long-running request an action handed over.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Any, Optional
@@ -22,14 +25,16 @@ from aws_durable_execution_sdk_python.config import (  # type: ignore[import-not
     Duration,
 )
 
+import action_output
 import providers
-import queue_environment
+import session_env
 import worker_registry
 from worker_protocol import (
     DeadlineWorker,
     WorkerNotUsableError,
     WorkerProtocolError,
     default_capabilities,
+    unwrap_parameters,
 )
 
 logger = logging.getLogger()
@@ -39,12 +44,10 @@ FARM_ID = os.environ["FARM_ID"]
 FLEET_ID = os.environ["FLEET_ID"]
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 
-# Retry and poll timing is the worker's policy, not a provider's: every wait below
-# suspends the execution, so a longer interval costs nothing and only delays noticing.
+# Poll timing is the worker's policy, not a provider's: every wait below suspends the
+# execution, so a longer interval costs nothing and only delays noticing.
 TASK_POLL_SECONDS = int(os.environ.get("TASK_POLL_SECONDS", "30"))
 MAX_TASK_POLLS = int(os.environ.get("MAX_TASK_POLLS", "120"))
-SUBMIT_RETRY_SECONDS = int(os.environ.get("SUBMIT_RETRY_SECONDS", "60"))
-MAX_SUBMIT_ATTEMPTS = max(1, int(os.environ.get("MAX_SUBMIT_ATTEMPTS", "10")))
 
 # Backstop so an orphaned execution cannot idle for the stack's whole ExecutionTimeout.
 # Raise it for bursty jobs; at the usual 15s interval 20 polls is about five minutes.
@@ -53,6 +56,23 @@ MAX_LOOP_ITERATIONS = int(os.environ.get("MAX_LOOP_ITERATIONS", "2000"))
 
 # The service's limit on a progressMessage; a longer one fails the whole request.
 MAX_PROGRESS_MESSAGE = 4096
+
+# The same mapping the Deadline Cloud worker agent uses. A timed-out action is a failure to
+# the service, which has no separate status for it.
+COMPLETED_STATUS = {
+    "SUCCESS": "SUCCEEDED",
+    "FAILED": "FAILED",
+    "CANCELED": "CANCELED",
+    "TIMEOUT": "FAILED",
+}
+
+ACTION_KINDS = ("taskRun", "envEnter", "envExit")
+
+JOB_ATTACHMENTS_MESSAGE = (
+    "This worker does not support job attachments: its session directory is discarded "
+    "whenever the worker suspends, so staged input files would be gone before the task "
+    "ran. Submit without job attachments, or use a fleet whose workers keep a filesystem."
+)
 
 
 # -- durable steps ---------------------------------------------------------------
@@ -108,30 +128,6 @@ def heartbeat(step_context, worker_id: str, progress: dict[str, Any]) -> dict[st
 
 
 @durable_step
-def enter_queue_environment(
-    step_context, worker_id: str, job_id: str, environment_id: str
-) -> dict[str, Any]:
-    """Return the variables a queue environment defines, or why it cannot be honored.
-
-    The error is returned rather than raised so one action fails, not the execution.
-    """
-    worker = DeadlineWorker(
-        farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
-    )
-    try:
-        details = worker.get_environment_details(
-            job_id=job_id, environment_id=environment_id
-        )
-        variables = queue_environment.apply(
-            environment_details=details, logger_=step_context.logger
-        )
-        return {"variables": variables}
-    except (queue_environment.UnsupportedEnvironmentError, WorkerProtocolError) as exc:
-        step_context.logger.error(f"Queue environment {environment_id} failed: {exc}")
-        return {"error": str(exc)}
-
-
-@durable_step
 def poll_schedule(
     step_context, worker_id: str, updated_session_actions: dict[str, Any]
 ) -> dict[str, Any]:
@@ -162,41 +158,90 @@ def poll_schedule(
 
 
 @durable_step
-def submit_task(
+def run_action(
     step_context,
-    provider_name: str,
-    request_json: str,
-    task_id: str,
-    attempt: int = 0,
+    worker_id: str,
+    session_id: str,
+    queue_id: str,
+    job_id: str,
+    action: dict[str, Any],
+    env_layers: list[list[Any]],
 ) -> dict[str, Any]:
-    """Ask a provider to start its request, returning its handle or an error.
+    """Run one session action to completion and report what it did.
 
-    `attempt` is an argument so each retry is a distinct step; without it a replay would
-    return the first attempt's error forever instead of resubmitting.
+    Templates and job parameters are fetched here rather than checkpointed: a step template
+    can be far larger than the checkpoint size limit. Errors are returned rather than raised
+    so a bad job costs one action, not the worker.
     """
+    # Imported here so the durable worker module stays importable without openjd-sessions,
+    # which the tests rely on to stub this seam out.
+    import session_runner
+
+    definition = action["definition"]
+    kind = next(name for name in ACTION_KINDS if name in definition)
+    worker = DeadlineWorker(
+        farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
+    )
     try:
-        provider = providers.resolve(provider_name)
-        request = json.loads(request_json) if request_json else {}
-        if not isinstance(request, dict):
-            raise ValueError("A Request must be a JSON object.")
-        result = provider.submit(request, task_id=task_id)
-    except providers.UnknownProviderError as exc:
-        result = {"error": str(exc), "retryable": False}
-    except Exception as exc:  # A provider defect must cost one task, not the worker.
-        step_context.logger.exception(f"Provider {provider_name} failed to submit")
-        result = {"error": f"{type(exc).__name__}: {exc}", "retryable": False}
-    # Checkpointed so the failure path reports a stable `endedAt` on replay.
-    result["submittedAt"] = worker_registry.utc_now_iso()
+        environment_id = (
+            None if kind == "taskRun" else definition[kind].get("environmentId")
+        )
+        entities = worker.get_job_entities(
+            identifiers=[
+                {"jobDetails": {"jobId": job_id}},
+                {"stepDetails": {"jobId": job_id, "stepId": definition["taskRun"]["stepId"]}}
+                if kind == "taskRun"
+                else {
+                    "environmentDetails": {"jobId": job_id, "environmentId": environment_id}
+                },
+            ]
+        )
+        job_details = entities["jobDetails"]
+        template_key = "stepDetails" if kind == "taskRun" else "environmentDetails"
+        # A queue with no role leaves the base environment without credentials, which is
+        # what keeps a task's script off the worker's own identity.
+        credentials = (
+            worker.assume_queue_role(queue_id=queue_id)
+            if job_details.get("queueRoleArn")
+            else None
+        )
+        result = session_runner.run_action(
+            kind=kind,
+            session_id=session_id,
+            template=entities[template_key]["template"],
+            job_parameters=unwrap_parameters(job_details.get("parameters"), task=False),
+            task_parameters=unwrap_parameters(
+                definition.get("taskRun", {}).get("parameters"), task=True
+            ),
+            path_mapping_rules=job_details.get("pathMappingRules"),
+            os_env_vars=session_env.compose(
+                session_env.base_env(region=REGION, credentials=credentials), env_layers
+            ),
+            environment_id=environment_id,
+        )
+    except (
+        WorkerProtocolError,
+        session_runner.SessionRunnerError,
+        action_output.MalformedOutputError,
+    ) as exc:
+        step_context.logger.error(f"Action {action['sessionActionId']} could not run: {exc}")
+        result = _unrun(str(exc))
+    except Exception as exc:  # A defect here must cost one action, not the worker.
+        step_context.logger.exception(f"Action {action['sessionActionId']} raised")
+        result = _unrun(f"{type(exc).__name__}: {exc}")
+    result["endedAt"] = worker_registry.utc_now_iso()
     return result
 
 
 @durable_step
-def poll_task(step_context, provider_name: str, handle: Any) -> dict[str, Any]:
-    """Ask a provider whether its request has finished."""
+def poll_await(step_context, provider_name: str, handle: Any) -> dict[str, Any]:
+    """Ask a provider whether the request an action handed over has finished."""
     try:
         provider = providers.resolve(provider_name)
         result = provider.poll(handle)
-    except Exception as exc:
+    except providers.UnknownProviderError as exc:
+        result = {"state": "FAILED", "message": str(exc)}
+    except Exception as exc:  # A provider defect must cost one action, not the worker.
         step_context.logger.exception(f"Provider {provider_name} failed to poll")
         result = {"state": "FAILED", "message": f"{type(exc).__name__}: {exc}"}
     result["observedAt"] = worker_registry.utc_now_iso()
@@ -235,6 +280,9 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
     registration = context.step(register_worker(host_name))
     worker_id = registration["workerId"]
 
+    # Per session, in entry order. Rebuilt from step results on replay, and the only way an
+    # environment's variables reach an action that runs in a later invocation.
+    env_layers: dict[str, list[list[Any]]] = {}
     idle_polls = 0
     tasks_completed = 0
     stop_reason = "loop-limit-reached"
@@ -259,7 +307,7 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
             # abandons a request in flight.
             stop_reason = "scale-in-drain"
             tasks_completed += _finish_assigned_work(
-                context=context, worker_id=worker_id, poll=poll
+                context=context, worker_id=worker_id, poll=poll, env_layers=env_layers
             )
             break
 
@@ -273,7 +321,7 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
 
         idle_polls = 0
         tasks_completed += _finish_assigned_work(
-            context=context, worker_id=worker_id, poll=poll
+            context=context, worker_id=worker_id, poll=poll, env_layers=env_layers
         )
 
     context.step(deregister_worker(worker_id))
@@ -285,14 +333,19 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
 
 
 def _finish_assigned_work(
-    *, context: DurableContext, worker_id: str, poll: dict[str, Any]
+    *,
+    context: DurableContext,
+    worker_id: str,
+    poll: dict[str, Any],
+    env_layers: dict[str, list[list[Any]]],
 ) -> int:
     """Run every action this poll assigned, reporting each result as it completes.
 
     Returns how many actions succeeded.
     """
     succeeded = 0
-    for session in (poll.get("assignedSessions") or {}).values():
+    for session_id, session in (poll.get("assignedSessions") or {}).items():
+        layers = env_layers.setdefault(session_id, [])
         session_failed = False
         for action in session["sessionActions"]:
             action_id = action["sessionActionId"]
@@ -310,8 +363,11 @@ def _finish_assigned_work(
                 result = _run_session_action(
                     context=context,
                     worker_id=worker_id,
+                    session_id=session_id,
+                    queue_id=session["queueId"],
                     job_id=session["jobId"],
                     action=action,
+                    env_layers=layers,
                 )
                 if result.get("completedStatus") == "SUCCEEDED":
                     succeeded += 1
@@ -321,6 +377,8 @@ def _finish_assigned_work(
             # One result per call, in assigned order. The service rejects an out-of-order
             # report with "comes in a wrong order" and drops every result in the request.
             context.step(poll_schedule(worker_id, {action_id: result}))
+        if not layers:
+            del env_layers[session_id]
     return succeeded
 
 
@@ -328,43 +386,22 @@ def _run_session_action(
     *,
     context: DurableContext,
     worker_id: str,
+    session_id: str,
+    queue_id: str,
     job_id: str,
     action: dict[str, Any],
+    env_layers: list[list[Any]],
 ) -> dict[str, Any]:
     """Run one assigned session action and return its result for the next heartbeat."""
     definition = action["definition"]
     action_id = action["sessionActionId"]
     started_at = context.step(mark_action_started(action_id))
 
-    if "envEnter" in definition:
-        entered = context.step(
-            enter_queue_environment(
-                worker_id, job_id, definition["envEnter"]["environmentId"]
-            )
-        )
-        if "error" in entered:
-            return _action_result(
-                "FAILED", started_at, started_at, message=entered["error"]
-            )
-        return _action_result("SUCCEEDED", started_at, started_at, exit_code=0)
-
-    if "envExit" in definition:
-        # Entering only collected variables, and the Lambda sandbox is discarded anyway.
-        return _action_result("SUCCEEDED", started_at, started_at, exit_code=0)
-
     if "syncInputJobAttachments" in definition:
-        return _action_result(
-            "FAILED",
-            started_at,
-            started_at,
-            message=(
-                "This worker does not support job attachments: it has no session "
-                "directory to stage input files into. Submit without job attachments, "
-                "or use a fleet whose workers have a filesystem."
-            ),
-        )
+        return _action_result("FAILED", started_at, started_at, message=JOB_ATTACHMENTS_MESSAGE)
 
-    if "taskRun" not in definition:
+    kind = next((name for name in ACTION_KINDS if name in definition), None)
+    if kind is None:
         return _action_result(
             "FAILED",
             started_at,
@@ -372,50 +409,71 @@ def _run_session_action(
             message=f"Unsupported session action type: {sorted(definition)}",
         )
 
-    return _run_provider_task(
+    outcome = context.step(
+        run_action(worker_id, session_id, queue_id, job_id, action, list(env_layers))
+    )
+
+    if kind == "envEnter" and outcome["state"] == "SUCCESS":
+        env_layers.append([definition["envEnter"]["environmentId"], outcome["envDelta"]])
+    elif kind == "envExit":
+        # Un-layered however the exit went: the environment is being left either way.
+        env_layers[:] = session_env.drop(env_layers, definition["envExit"]["environmentId"])
+
+    if outcome["state"] != "SUCCESS":
+        return _action_result(
+            COMPLETED_STATUS[outcome["state"]],
+            started_at,
+            outcome["endedAt"],
+            exit_code=outcome["exitCode"],
+            message=outcome["message"] or f"The action ended {outcome['state']}",
+        )
+
+    tokens = outcome["awaitTokens"]
+    if len(tokens) > 1:
+        return _action_result(
+            "FAILED",
+            started_at,
+            outcome["endedAt"],
+            exit_code=outcome["exitCode"],
+            message=(
+                f"This action printed {len(tokens)} '{action_output.AWAIT_PREFIX}' lines. "
+                f"An action can hand the worker at most one request to await."
+            ),
+        )
+    if not tokens:
+        # An ordinary Open Job Description action: it did its own work and is finished.
+        return _action_result(
+            "SUCCEEDED",
+            started_at,
+            outcome["endedAt"],
+            exit_code=outcome["exitCode"],
+            message=outcome["message"],
+            progressPercent=100.0,
+        )
+
+    return _await_request(
         context=context,
         worker_id=worker_id,
         action_id=action_id,
         started_at=started_at,
-        task_run=definition["taskRun"],
+        token=tokens[0],
     )
 
 
-def _run_provider_task(
+def _await_request(
     *,
     context: DurableContext,
     worker_id: str,
     action_id: str,
     started_at: str,
-    task_run: dict[str, Any],
+    token: dict[str, Any],
 ) -> dict[str, Any]:
-    """Dispatch a task's request to its provider and wait, unbilled, for the result."""
-    parameters = task_run.get("parameters") or {}
-    provider_name = parameters.get("Provider") or ""
-    request_json = parameters.get("Request") or ""
-    task_id = task_run.get("taskId") or action_id
-
-    for attempt in range(MAX_SUBMIT_ATTEMPTS):
-        submission = context.step(
-            submit_task(provider_name, request_json, task_id, attempt)
-        )
-        if "handle" in submission or not submission.get("retryable"):
-            break
-        context.wait(Duration.from_seconds(SUBMIT_RETRY_SECONDS))
-
-    if "handle" not in submission:
-        return _action_result(
-            "FAILED",
-            started_at,
-            submission["submittedAt"],
-            exit_code=1,
-            message=submission.get("error", "The provider did not accept the request"),
-        )
-
-    last_observed_at = submission["submittedAt"]
+    """Wait, unbilled, for the long-running request an action handed over."""
+    provider_name = token["provider"]
+    last_observed_at = started_at
     for _ in range(MAX_TASK_POLLS):
         context.wait(Duration.from_seconds(TASK_POLL_SECONDS))
-        status = context.step(poll_task(provider_name, submission["handle"]))
+        status = context.step(poll_await(provider_name, token["handle"]))
 
         # Heartbeat on every poll, or the service marks the worker NOT_RESPONDING and
         # reassigns the task. The same response is where cancellation is observed.
@@ -476,6 +534,18 @@ def _run_provider_task(
     )
 
 
+def _unrun(message: str) -> dict[str, Any]:
+    """The outcome of an action the worker could not get as far as running."""
+    return {
+        "state": "FAILED",
+        "exitCode": None,
+        "message": message,
+        "progress": None,
+        "awaitTokens": [],
+        "envDelta": {"set": {}, "unset": []},
+    }
+
+
 def _action_result(
     completed_status: str,
     started_at: str,
@@ -518,27 +588,20 @@ def _summarize_sessions(assigned_sessions: dict[str, Any]) -> dict[str, Any]:
 
 
 def _summarize_definition(definition: dict[str, Any]) -> dict[str, Any]:
-    """Flatten a session action definition to its plain-value essentials."""
+    """Keep the parts of a session action definition the worker needs.
+
+    Task parameters stay in their tagged wire form: unwrapping them can fail, and it has to
+    fail inside the step that runs the action rather than the one that collects the schedule.
+    """
     if "taskRun" in definition:
-        raw_parameters = definition["taskRun"].get("parameters", {})
         return {
             "taskRun": {
                 "taskId": definition["taskRun"].get("taskId"),
                 "stepId": definition["taskRun"].get("stepId"),
-                "parameters": {
-                    name: _unwrap_parameter(value) for name, value in raw_parameters.items()
-                },
+                "parameters": definition["taskRun"].get("parameters", {}),
             }
         }
     for key in ("envEnter", "envExit", "syncInputJobAttachments"):
         if key in definition:
             return {key: definition[key]}
     return {}
-
-
-def _unwrap_parameter(tagged_value: dict[str, Any]) -> Optional[str]:
-    """Return the value from a `{type: value}` task parameter."""
-    for key in ("string", "path", "int", "float", "chunkInt"):
-        if key in tagged_value:
-            return tagged_value[key]
-    return None

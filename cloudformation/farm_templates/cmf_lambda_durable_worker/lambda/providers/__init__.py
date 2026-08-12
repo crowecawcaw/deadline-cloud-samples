@@ -1,20 +1,18 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-"""Registry of the long-running APIs a task can dispatch to.
+"""Registry of the long-running requests a task can hand back to the worker to await.
 
-A provider is a module with exactly two functions. Every value is plain JSON, because
+A provider is a module with exactly one function. Every value is plain JSON, because
 results cross durable checkpoint boundaries:
 
-    submit(request: dict, *, task_id: str) -> {"handle": <any JSON>}
-                                            | {"error": str, "retryable": bool}
     poll(handle) -> {"state": "RUNNING" | "SUCCEEDED" | "FAILED",
                      "message": str, "outputUri": str}     # last two optional
 
-`request` is whatever the job template put in the task's `Request` parameter, and
-`handle` is whatever the provider needs to identify the request it started. Neither is
-inspected by the worker.
+The task's own `onRun` script starts the request and names the provider and handle in a
+`durable_lambda_await:` token. `handle` is whatever that provider needs to recognize the
+request again; the worker never inspects it.
 
-Providers never sleep, retry, or count attempts: they report `retryable` and the worker
-decides the timing, because only the worker can wait without being billed for it.
+Providers never sleep, retry, or count attempts: the worker decides the timing, because
+only the worker can wait without being billed for it.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ PROVIDER_MODULES = {
 
 
 class UnknownProviderError(Exception):
-    """A task named a provider that is not registered."""
+    """An await token named a provider that is not registered."""
 
 
 def known_providers() -> list[str]:
