@@ -1,26 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-"""The shared registry of live durable workers.
+"""The shared registry of live durable workers, one row per worker.
 
-The scaling handler needs to know how many workers are running and needs a way to ask
-specific ones to stop. Deadline Cloud's fleet size recommendation says only how many
-workers should exist, and a customer-managed fleet leaves worker lifecycle entirely to
-the fleet owner, so this table is what connects the two halves of the sample.
-
-One row per worker, keyed by (fleetId, workerId):
-
-    fleetId    partition key, so a scaling event can query just its own fleet
-    workerId   sort key, the Deadline Cloud worker ID
-    startedAt  ISO-8601 registration time, used to pick drain candidates
-    drain      set by the scaling handler; the worker shuts down when it sees this
-
-The worker writes its row when it registers, polls `drain` on each heartbeat, and
-deletes its row when it deregisters.
+Keyed by (fleetId, workerId), with a `startedAt` that scale-in ranks drain candidates by
+and a `drain` flag the scaling handler sets and each worker polls on its heartbeat.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from functools import lru_cache
 
 import boto3
@@ -30,14 +19,12 @@ logger = logging.getLogger(__name__)
 
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "")
 
-# How long a registry row survives if its worker never deregisters. Comfortably longer
-# than any worker should live, so expiry only ever catches abandoned rows.
+# Comfortably longer than any worker should live, so expiry only catches abandoned rows.
 REGISTRY_TTL_SECONDS = int(os.environ.get("REGISTRY_TTL_SECONDS", str(48 * 3600)))
 
 
 @lru_cache(maxsize=1)
 def _table():
-    """Return the registry table, built once per execution environment."""
     return boto3.resource("dynamodb").Table(REGISTRY_TABLE)
 
 
@@ -50,16 +37,13 @@ def register(*, fleet_id: str, worker_id: str, started_at: str) -> None:
                 "workerId": worker_id,
                 "startedAt": started_at,
                 "drain": False,
-                # Backstop for a worker that dies without deregistering. A stale row
-                # counts against fleet capacity, so one that is never cleaned up would
-                # quietly stop the fleet from ever scaling out again.
+                # A row that is never cleaned up counts against fleet capacity forever
+                # and would quietly stop the fleet from scaling out again.
                 "expiresAt": _expiry_epoch(),
             }
         )
     except ClientError as exc:
-        # A registry write failure must not take down a worker that registered
-        # successfully with Deadline Cloud. The cost is that this worker is invisible
-        # to scaling decisions until it exits.
+        # Best effort: a registry failure must not fail a worker the service accepted.
         logger.error(f"Failed to add {worker_id} to the registry: {exc}")
 
 
@@ -71,8 +55,7 @@ def should_drain(*, fleet_id: str, worker_id: str) -> bool:
             ConsistentRead=True,
         )
     except ClientError as exc:
-        # Treat an unreadable registry as "keep working". Draining on a transient
-        # read error would shrink the fleet for the wrong reason.
+        # Draining on a transient read error would shrink the fleet for the wrong reason.
         logger.error(f"Failed to read drain flag for {worker_id}: {exc}")
         return False
     return bool(response.get("Item", {}).get("drain", False))
@@ -87,21 +70,9 @@ def deregister(*, fleet_id: str, worker_id: str) -> None:
 
 
 def _expiry_epoch() -> int:
-    """The Unix timestamp at which an abandoned row should expire.
-
-    Only called from inside a durable step, for the same reason as `utc_now_iso`.
-    """
-    from datetime import datetime, timezone
-
     return int(datetime.now(timezone.utc).timestamp()) + REGISTRY_TTL_SECONDS
 
 
 def utc_now_iso() -> str:
-    """Return the current UTC time in ISO-8601 form.
-
-    Only ever called inside a durable step. A clock read is non-deterministic, so
-    calling it during replay outside a checkpoint would change the replayed value.
-    """
-    from datetime import datetime, timezone
-
+    """The current UTC time in ISO-8601 form. Only ever called inside a durable step."""
     return datetime.now(timezone.utc).isoformat()

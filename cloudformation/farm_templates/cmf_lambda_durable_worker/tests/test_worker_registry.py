@@ -1,43 +1,23 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """Unit tests for the live-worker registry.
 
-The registry sits between the two halves of the sample: the scaling handler counts rows
-to decide how many workers exist, and each worker polls its own row to learn whether it
-has been asked to drain. That makes its failure behavior more interesting than its
-success behavior, because the registry is a bookkeeping aid rather than the source of
-truth for either side. Every call therefore has to fail in the direction that keeps a
-healthy worker working, and these tests pin those directions down.
+The registry is a bookkeeping aid rather than the source of truth for either half of the
+sample, so every call has to fail in the direction that keeps a healthy worker working.
 
 Run from the parent directory with:
 
     python3 -m unittest discover -s tests
-
-The DynamoDB table is a mock, so the tests need no credentials and no network.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 import unittest
 import unittest.mock as mock
-from pathlib import Path
+from datetime import datetime
 
-from botocore.exceptions import ClientError
+from harness import FLEET_ID, WORKER_ID, client_error
 
-LAMBDA_DIR = Path(__file__).resolve().parents[1] / "lambda"
-sys.path.insert(0, str(LAMBDA_DIR))
-
-os.environ.setdefault("REGISTRY_TABLE", "test-registry")
-
-import worker_registry  # noqa: E402
-
-FLEET_ID = "fleet-" + "0" * 32
-WORKER_ID = "worker-" + "0" * 32
-
-
-def _client_error(code: str, operation: str) -> ClientError:
-    return ClientError({"Error": {"Code": code, "Message": f"simulated {code}"}}, operation)
+import worker_registry
 
 
 class TestRegister(unittest.TestCase):
@@ -52,24 +32,20 @@ class TestRegister(unittest.TestCase):
         item = table.put_item.call_args.kwargs["Item"]
         self.assertEqual(item["fleetId"], FLEET_ID)
         self.assertEqual(item["workerId"], WORKER_ID)
-        # startedAt is how scale-in ranks drain candidates, so a row without it would
-        # sort as the oldest worker and never be picked.
+        # Scale-in ranks drain candidates by startedAt, so a row without it would sort as
+        # the oldest worker and never be picked.
         self.assertEqual(item["startedAt"], "2026-01-01T00:00:00+00:00")
-        # drain is written explicitly rather than left absent, so the attribute exists
-        # from the moment the worker is visible to a scaling event.
         self.assertIs(item["drain"], False)
-        # An abandoned row counts against fleet capacity forever and would quietly stop
-        # the fleet from scaling out, so every row carries a DynamoDB TTL as a backstop.
-        self.assertIn("expiresAt", item)
+        # An abandoned row would count against fleet capacity forever, so every row
+        # carries a TTL as a backstop.
         self.assertIsInstance(item["expiresAt"], int)
         self.assertGreater(item["expiresAt"], 0)
 
     def test_a_write_failure_does_not_reach_the_caller(self):
-        # register() runs inside the same durable step as CreateWorker and the STARTED
-        # transition. Raising here would fail a worker that the service has already
-        # accepted, so the registry write is best-effort.
+        # This runs in the same step as CreateWorker and the STARTED transition, so
+        # raising would fail a worker the service has already accepted.
         table = mock.MagicMock()
-        table.put_item.side_effect = _client_error("ProvisionedThroughputExceededException", "PutItem")
+        table.put_item.side_effect = client_error("ThrottlingException", "PutItem")
         with mock.patch.object(worker_registry, "_table", return_value=table):
             with self.assertLogs(worker_registry.logger, level="ERROR"):
                 worker_registry.register(
@@ -100,9 +76,9 @@ class TestShouldDrain(unittest.TestCase):
 
     def test_a_read_failure_keeps_the_worker_working(self):
         # Draining is irreversible for this worker, so a transient read error must not
-        # trigger it: that would shrink the fleet for a reason unrelated to demand.
+        # trigger it and shrink the fleet for a reason unrelated to demand.
         table = mock.MagicMock()
-        table.get_item.side_effect = _client_error("ThrottlingException", "GetItem")
+        table.get_item.side_effect = client_error("ThrottlingException", "GetItem")
         with mock.patch.object(worker_registry, "_table", return_value=table):
             with self.assertLogs(worker_registry.logger, level="ERROR"):
                 self.assertFalse(
@@ -116,9 +92,8 @@ class TestShouldDrain(unittest.TestCase):
             worker_registry.should_drain(fleet_id=FLEET_ID, worker_id=WORKER_ID)
         kwargs = table.get_item.call_args.kwargs
         self.assertEqual(kwargs["Key"], {"fleetId": FLEET_ID, "workerId": WORKER_ID})
-        # An eventually consistent read can miss a flag the scaling handler just wrote,
-        # and the worker only looks once per heartbeat interval, so a stale answer
-        # delays scale-in by a whole poll.
+        # The worker looks once per heartbeat, so a stale answer delays scale-in by a
+        # whole poll.
         self.assertIs(kwargs["ConsistentRead"], True)
 
 
@@ -132,11 +107,9 @@ class TestDeregister(unittest.TestCase):
         )
 
     def test_a_delete_failure_does_not_reach_the_caller(self):
-        # The worker has already stopped with Deadline Cloud by this point. Raising
-        # would fail the durable execution over a row that only inflates the handler's
-        # worker count until the next successful pass.
+        # The worker has already stopped with Deadline Cloud by this point.
         table = mock.MagicMock()
-        table.delete_item.side_effect = _client_error("ThrottlingException", "DeleteItem")
+        table.delete_item.side_effect = client_error("ThrottlingException", "DeleteItem")
         with mock.patch.object(worker_registry, "_table", return_value=table):
             with self.assertLogs(worker_registry.logger, level="ERROR"):
                 worker_registry.deregister(fleet_id=FLEET_ID, worker_id=WORKER_ID)
@@ -144,13 +117,9 @@ class TestDeregister(unittest.TestCase):
 
 class TestUtcNowIso(unittest.TestCase):
     def test_returns_a_timezone_aware_iso_string(self):
-        from datetime import datetime
-
-        value = worker_registry.utc_now_iso()
-        # UpdateWorkerSchedule timestamps travel as strings through checkpoints and are
-        # parsed back with fromisoformat, so the value has to round-trip and carry an
-        # offset rather than being a naive local time.
-        parsed = datetime.fromisoformat(value)
+        # Timestamps travel as strings through checkpoints and are parsed back with
+        # fromisoformat, so the value has to round-trip and carry an offset.
+        parsed = datetime.fromisoformat(worker_registry.utc_now_iso())
         self.assertIsNotNone(parsed.tzinfo)
 
 

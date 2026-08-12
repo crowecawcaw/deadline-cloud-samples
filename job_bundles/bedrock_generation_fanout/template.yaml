@@ -1,70 +1,73 @@
 specificationVersion: 'jobtemplate-2023-09'
 name: Bedrock Generation Fanout
 
-# Each task describes one asynchronous Amazon Bedrock generation request. The durable
-# Lambda workers in the customer-managed fleet pick these up, submit the request, and
-# suspend until it finishes.
+# One task per clip. Each task names a provider and carries that provider's request body
+# verbatim, so switching model, settings, or service is a template edit and never a worker
+# code change. The durable Lambda workers in the customer-managed fleet dispatch the
+# request and suspend, unbilled, until it finishes.
 #
-# The step has no script: a durable Lambda worker reads the task parameters and makes
-# the API call itself rather than running a command on a host. The `hostRequirements`
-# block below is what keeps these tasks on that kind of worker.
-#
-# Everything the request needs is a TASK parameter, not a job parameter. A worker
-# receives task parameters directly in the `taskRun` session action, whereas job
-# parameters have to be fetched with `BatchGetJobEntity`, which this sample
-# deliberately does not implement. A job parameter here would silently never reach the
-# worker, which is worth knowing before adding one.
+# Everything is a TASK parameter, never a job parameter. A worker receives task parameters
+# directly in the `taskRun` session action, whereas job parameters have to be fetched with
+# `BatchGetJobEntity`, which this worker deliberately does not do: a job parameter would
+# silently never reach it.
 
 steps:
 - name: Generate
   parameterSpace:
     taskParameterDefinitions:
-    # One task per prompt. Edit this list, or override it in parameter_values.yaml,
-    # to change how many concurrent requests the fleet is asked to make. The fleet
-    # size recommendation follows the number of queued tasks, so a longer list is
-    # what drives scale-out.
-    - name: Prompt
+    # Single-valued, so it does not fan out. `sleep` is the credential-free provider, and
+    # a worker rejects any name it does not know with a message listing the ones it does.
+    - name: Provider
+      type: STRING
+      range: ["bedrock-async"]
+    # The fan-out parameter. `modelId` and `modelInput` reach StartAsyncInvoke untouched,
+    # so `modelInput` follows whatever schema the chosen model documents. Asynchronous
+    # invocation is the video generation models; image models such as Nova Canvas are
+    # synchronous only and cannot be polled.
+    #
+    # `modelId` comes last so the JSON never contains `}}`, which Open Job Description
+    # reads as the end of an interpolation expression. Separate any other adjacent closing
+    # braces with a space.
+    - name: Request
       type: STRING
       range:
-      - "a red sports car driving along a coastal highway at sunset, cinematic"
-      - "a slow aerial push over a misty pine forest at dawn"
-      - "timelapse of storm clouds gathering over a desert mesa"
-    # Single-valued ranges: these are settings rather than things to fan out over, so
-    # every task gets the same value. Combined with the prompts above they would form a
-    # cross product, so they must stay single-valued to keep one task per prompt.
-    - name: ModelId
-      type: STRING
-      # Must support asynchronous invocation, which the video generation models do;
-      # image models such as Nova Canvas are synchronous only and cannot be polled.
-      range: ["luma.ray-v2:0"]
-    - name: Duration
-      type: STRING
-      range: ["5s"]
-    - name: Resolution
-      type: STRING
-      # Higher resolutions take longer to generate, which the worker sleeps through.
-      range: ["540p"]
+      - >-
+        {"modelInput": {"prompt": "a red sports car driving along a coastal highway at
+        sunset, cinematic",
+        "duration": "5s", "resolution": "540p", "aspect_ratio": "16:9", "loop": false},
+        "modelId": "luma.ray-v2:0"}
+      - >-
+        {"modelInput": {"prompt": "a slow aerial push over a misty pine forest at dawn",
+        "duration": "5s", "resolution": "540p", "aspect_ratio": "16:9", "loop": false},
+        "modelId": "luma.ray-v2:0"}
+      - >-
+        {"modelInput": {"prompt": "timelapse of storm clouds gathering over a desert mesa",
+        "duration": "5s", "resolution": "540p", "aspect_ratio": "16:9", "loop": false},
+        "modelId": "luma.ray-v2:0"}
   hostRequirements:
     attributes:
-      # Restrict these tasks to the durable Lambda workers. Those workers report this
-      # attribute in their capabilities, so a conventional worker in another fleet will
-      # not be assigned a step it has no way to run.
+      # Restrict these tasks to the durable Lambda workers, which report this attribute in
+      # their capabilities. Without it a conventional worker could be assigned a step it
+      # has no way to run.
       - name: attr.durable.lambda
         anyOf: ["true"]
   script:
     actions:
       onRun:
-        # A durable Lambda worker never executes this command; it inspects the task
-        # parameters instead. The action is still required by the specification, and
-        # keeping it meaningful means the same job can be run on a normal worker for
-        # comparison, or checked with "openjd run".
+        # A durable Lambda worker never runs this; it reads the task parameters instead.
+        # Keeping the action meaningful means `openjd run` and a conventional worker both
+        # show exactly which request would have been dispatched.
         command: bash
         args: ["{{Task.File.Report}}"]
     embeddedFiles:
+    # The request is its own file so that no shell quoting can mangle the JSON.
+    - name: RequestBody
+      type: TEXT
+      data: |
+        {{Task.Param.Request}}
     - name: Report
       type: TEXT
       data: |
-        echo "Requested {{Task.Param.ModelId}} generation"
-        echo "  prompt:     {{Task.Param.Prompt}}"
-        echo "  duration:   {{Task.Param.Duration}}"
-        echo "  resolution: {{Task.Param.Resolution}}"
+        echo "provider: {{Task.Param.Provider}}"
+        echo "request:"
+        cat "{{Task.File.RequestBody}}"

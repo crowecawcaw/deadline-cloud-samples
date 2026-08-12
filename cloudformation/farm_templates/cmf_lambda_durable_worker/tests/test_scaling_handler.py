@@ -1,51 +1,26 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """Unit tests for the scaling handler's reconciliation decisions.
 
-Scaling is the part of this sample with no service-side safety net: Deadline Cloud
-never starts or stops workers for a customer-managed fleet, so a mistake here either
-strands the fleet at zero workers or asks for more workers than `maxWorkerCount`
-allows. These tests pin down the decisions that are invisible until a fleet is under
-load: how scale-out is capped, which workers scale-in picks, and what happens when the
-fleet count cannot be read.
+Scaling is the part of this sample with no service-side safety net: a mistake either
+strands the fleet at zero workers or asks for more than `maxWorkerCount` allows.
 
 Run from the parent directory with:
 
     python3 -m unittest discover -s tests
-
-Every AWS client is a mock, so the tests need no credentials, no network, and no
-DynamoDB table.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import sys
 import unittest
 import unittest.mock as mock
-from pathlib import Path
 
-import boto3  # noqa: F401  (imported so the patches below can resolve `boto3.client`)
-from botocore.exceptions import ClientError
+from harness import FARM_ID, FLEET_ID, client_error
 
-LAMBDA_DIR = Path(__file__).resolve().parents[1] / "lambda"
-sys.path.insert(0, str(LAMBDA_DIR))
-
-# Required at import time by the scaling handler.
-os.environ.setdefault(
-    "WORKER_FUNCTION_ARN", "arn:aws:lambda:us-west-2:123456789012:function:durable-worker"
-)
-os.environ.setdefault("REGISTRY_TABLE", "test-registry")
-
-# The handler builds its Lambda client and DynamoDB resource at module scope. Patching
-# boto3 across the import keeps that from constructing anything that could reach AWS or
-# demand a region, and every test replaces those module globals with its own mocks
-# anyway.
+# The handler builds its Lambda client and DynamoDB resource at module scope, and every
+# test replaces those globals with its own mocks.
 with mock.patch("boto3.client"), mock.patch("boto3.resource"):
-    import scaling_handler  # noqa: E402
-
-FARM_ID = "farm-" + "0" * 32
-FLEET_ID = "fleet-" + "0" * 32
+    import scaling_handler
 
 
 def _event(new_fleet_size: int, old_fleet_size: int = 0) -> dict:
@@ -66,13 +41,7 @@ def _registry_row(worker_id: str, started_at: str, **extra) -> dict:
     return {"fleetId": FLEET_ID, "workerId": worker_id, "startedAt": started_at, **extra}
 
 
-def _client_error(code: str, operation: str) -> ClientError:
-    return ClientError({"Error": {"Code": code, "Message": f"simulated {code}"}}, operation)
-
-
 class _ScalingHandlerTestCase(unittest.TestCase):
-    """Shared harness: a mock registry table, Lambda client, and fleet worker count."""
-
     def _run_handler(
         self,
         *,
@@ -101,8 +70,6 @@ class _ScalingHandlerTestCase(unittest.TestCase):
 
 
 class TestScaleOut(_ScalingHandlerTestCase):
-    """A recommendation above the current size has to become new executions."""
-
     def test_starts_one_execution_per_missing_worker(self):
         response, table, lambda_client = self._run_handler(
             new_fleet_size=3,
@@ -114,8 +81,8 @@ class TestScaleOut(_ScalingHandlerTestCase):
         table.update_item.assert_not_called()
 
     def test_recommendation_above_max_workers_is_clamped(self):
-        # The recommendation is Deadline Cloud's view of demand and ignores this
-        # sample's own ceiling, so the handler has to apply MAX_WORKERS itself.
+        # The recommendation is Deadline Cloud's view of demand and ignores this sample's
+        # own ceiling.
         _, _, lambda_client = self._run_handler(
             new_fleet_size=50, registry=[], max_workers=4
         )
@@ -127,12 +94,10 @@ class TestScaleOut(_ScalingHandlerTestCase):
         names = set()
         for call in lambda_client.invoke.call_args_list:
             kwargs = call.kwargs
-            # RequestResponse would cap the worker at the 15-minute synchronous invoke
-            # limit; a durable execution needs the asynchronous path to outlive that.
+            # RequestResponse would cap the worker at the 15-minute synchronous limit.
             self.assertEqual(kwargs["InvocationType"], "Event")
             self.assertEqual(kwargs["FunctionName"], scaling_handler.WORKER_FUNCTION_ARN)
-            # A reused execution name would make a redelivered EventBridge event a
-            # no-op instead of a second worker, so names must not collide.
+            # A reused name would make a redelivered event a no-op instead of a worker.
             names.add(kwargs["DurableExecutionName"])
             self.assertEqual(
                 json.loads(kwargs["Payload"])["hostName"], kwargs["DurableExecutionName"]
@@ -144,9 +109,8 @@ class TestScaleOutHeadroom(_ScalingHandlerTestCase):
     """Scale-out is bounded by the fleet, not by the registry."""
 
     def test_fleet_worker_count_caps_the_number_started(self):
-        # The registry is empty but the fleet still holds 8 workers, so only 2 of the
-        # 5 requested workers can be started. Starting all 5 would fail at
-        # CreateWorker with a ConflictException.
+        # The registry is empty but the fleet still holds 8 workers, so starting all 5
+        # requested workers would fail at CreateWorker with a ConflictException.
         _, _, lambda_client = self._run_handler(
             new_fleet_size=5, registry=[], fleet_worker_count=8, max_workers=10
         )
@@ -159,14 +123,13 @@ class TestScaleOutHeadroom(_ScalingHandlerTestCase):
         lambda_client.invoke.assert_not_called()
 
     def test_unreadable_fleet_count_does_not_drop_the_event(self):
-        # Deliberately permissive: CreateWorker enforces maxWorkerCount on its own, so
-        # a failed count must not stall the fleet at zero workers. The scaling event is
-        # still honored up to MAX_WORKERS.
+        # Deliberately permissive: CreateWorker enforces maxWorkerCount on its own, so a
+        # failed count must not stall the fleet at zero workers.
         with self.assertLogs(level="WARNING"):
             _, _, lambda_client = self._run_handler(
                 new_fleet_size=3,
                 registry=[],
-                fleet_worker_count=_client_error("AccessDeniedException", "ListWorkers"),
+                fleet_worker_count=client_error("AccessDeniedException", "ListWorkers"),
                 max_workers=10,
             )
         self.assertEqual(lambda_client.invoke.call_count, 3)
@@ -175,7 +138,7 @@ class TestScaleOutHeadroom(_ScalingHandlerTestCase):
         with mock.patch.object(
             scaling_handler,
             "_fleet_worker_count",
-            side_effect=_client_error("ThrottlingException", "ListWorkers"),
+            side_effect=client_error("ThrottlingException", "ListWorkers"),
         ), mock.patch.object(scaling_handler, "MAX_WORKERS", 7):
             with self.assertLogs(level="WARNING"):
                 headroom = scaling_handler._headroom(farm_id=FARM_ID, fleet_id=FLEET_ID)
@@ -196,8 +159,7 @@ class TestScaleIn(_ScalingHandlerTestCase):
         )
         self.assertEqual(table.update_item.call_count, 2)
         self.assertEqual(json.loads(response["body"])["action"], "marked 2 worker(s) to drain")
-        # Draining is a flag, not a stop: nothing is invoked and no execution is killed,
-        # so a worker holding a request in flight finishes it first.
+        # A flag, not a stop: a worker holding a request in flight finishes it first.
         lambda_client.invoke.assert_not_called()
 
     def test_newest_workers_are_drained_first(self):
@@ -209,8 +171,7 @@ class TestScaleIn(_ScalingHandlerTestCase):
         _, table, _ = self._run_handler(new_fleet_size=1, registry=registry)
 
         drained = [call.kwargs["Key"]["workerId"] for call in table.update_item.call_args_list]
-        # Newest first, because a recently started worker is least likely to be holding
-        # a long-running Bedrock request, so draining it sheds capacity soonest.
+        # A recently started worker is least likely to hold a long-running request.
         self.assertEqual(drained, ["worker-newest", "worker-middle"])
 
     def test_already_draining_workers_are_not_counted_or_re_flagged(self):
@@ -219,7 +180,6 @@ class TestScaleIn(_ScalingHandlerTestCase):
             _registry_row("worker-2", "2026-01-01T00:10:00+00:00", drain=True),
         ]
         response, table, _ = self._run_handler(new_fleet_size=1, registry=registry)
-        # Only one worker is still active, so the fleet is already the right size.
         # Counting the draining worker would drain the last healthy one as well.
         self.assertEqual(json.loads(response["body"])["current"], 1)
         table.update_item.assert_not_called()

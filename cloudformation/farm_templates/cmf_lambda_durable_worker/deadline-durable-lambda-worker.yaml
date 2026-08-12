@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >-
   A Deadline Cloud customer-managed fleet whose workers are Lambda durable functions.
-  Workers register with the fleet, heartbeat, dispatch Amazon Bedrock generation
-  requests, and suspend without compute charges while those requests run.
+  Workers register with the fleet, heartbeat, dispatch the long-running API request a
+  task describes, and suspend without compute charges while that request runs.
 
 Parameters:
   FarmId:
@@ -21,24 +21,16 @@ Parameters:
     MaxValue: 50
     Description: >-
       Maximum concurrent durable worker executions. Also caps the fleet's worker count,
-      so raising it raises both the Bedrock request concurrency and the cost ceiling.
-  ModelId:
-    Type: String
-    Default: luma.ray-v2:0
-    Description: >-
-      Bedrock model to invoke asynchronously. Must support StartAsyncInvoke, which is
-      the video generation models; image models such as Nova Canvas are synchronous
-      only and cannot be polled. Confirm availability in your Region with
-      "aws bedrock list-foundation-models".
-  GenerationPollSeconds:
+      so raising it raises both the request concurrency and the cost ceiling.
+  TaskPollSeconds:
     Type: Number
     Default: 30
     MinValue: 5
     MaxValue: 900
     Description: >-
-      Seconds a worker sleeps between checks on an in-flight Bedrock request. The
-      execution is suspended for this whole interval, so a longer value costs nothing
-      and only delays noticing completion.
+      Seconds a worker sleeps between checks on an in-flight task request. The execution
+      is suspended for this whole interval, so a longer value costs nothing and only
+      delays noticing completion.
   LambdaCodeBucket:
     Type: String
     Description: >-
@@ -92,22 +84,22 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/deadline/*:*
+              # Both of the following are scoped to any fleet in this farm rather than to
+              # this fleet's ID: the fleet resource takes this role's ARN as a property,
+              # so naming the fleet here would make the two resources depend on each
+              # other. The trust policy already restricts this role to Deadline Cloud,
+              # which hands it only to workers it has created. Like the other worker
+              # actions, both authorize against the worker resource, so the ARNs end in
+              # `/worker/*`.
+              #
+              # Fetches a queue environment's template when an envEnter action arrives.
+              - Effect: Allow
+                Action: deadline:BatchGetJobEntity
+                Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
               # A worker deregisters itself when it drains. The managed fleet-worker
               # policy covers UpdateWorker but not DeleteWorker, so without this a
               # drained worker would linger in the fleet and keep occupying capacity
               # against maxWorkerCount until the service timed it out.
-              #
-              # Scoped to any fleet in this farm rather than to this fleet's ID:
-              # the fleet resource takes this role's ARN as a property, so naming the
-              # fleet here would make the two resources depend on each other. The
-              # trust policy already restricts this role to Deadline Cloud, which
-              # hands it only to workers it has created.
-              # Used to fetch a queue environment's template when the service assigns
-              # an envEnter action. Authorizes against the worker resource, like the
-              # other worker actions.
-              - Effect: Allow
-                Action: deadline:BatchGetJobEntity
-                Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
               - Effect: Allow
                 Action: deadline:DeleteWorker
                 Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/*/worker/*
@@ -117,7 +109,7 @@ Resources:
     Properties:
       FarmId: !Ref FarmId
       DisplayName: !Ref FleetName
-      Description: Workers run as Lambda durable functions and dispatch Bedrock requests.
+      Description: Workers run as Lambda durable functions and dispatch API requests.
       RoleArn: !GetAtt FleetRole.Arn
       MinWorkerCount: 0
       MaxWorkerCount: !Ref MaxWorkerCount
@@ -164,6 +156,7 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
+          # Matches the bedrock-async provider's OUTPUT_PREFIX default.
           - Id: ExpireGeneratedOutput
             Status: Enabled
             Prefix: generated/
@@ -224,11 +217,12 @@ Resources:
                   - deadline:CreateWorker
                   - deadline:AssumeFleetRoleForWorker
                 Resource: !Sub arn:${AWS::Partition}:deadline:${AWS::Region}:${AWS::AccountId}:farm/${FarmId}/fleet/${DurableFleet.FleetId}/worker/*
-              # StartAsyncInvoke additionally requires bedrock:InvokeModel: the
-              # async-invoke call is authorized as a model invocation, and without
-              # InvokeModel it fails with AccessDenied on the async-invoke resource.
-              # Both resources are named so this grant does not extend to other Bedrock
-              # usage in the account.
+              # For the bedrock-async provider. StartAsyncInvoke additionally requires
+              # bedrock:InvokeModel: the async-invoke call is authorized as a model
+              # invocation, and without InvokeModel it fails with AccessDenied on the
+              # async-invoke resource. Both resources are named so this grant does not
+              # extend to other Bedrock usage in the account. A new provider brings its
+              # own grants here.
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
@@ -237,7 +231,7 @@ Resources:
                 Resource:
                   - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*
                   - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:async-invoke/*
-              # Write only: Bedrock writes the generated output using these credentials,
+              # Write only: Bedrock writes the generated output with these credentials,
               # and nothing in this sample reads it back.
               - Effect: Allow
                 Action: s3:PutObject
@@ -271,8 +265,14 @@ Resources:
           FLEET_ID: !GetAtt DurableFleet.FleetId
           OUTPUT_BUCKET: !Ref OutputBucket
           REGISTRY_TABLE: !Ref WorkerRegistryTable
-          MODEL_ID: !Ref ModelId
-          GENERATION_POLL_SECONDS: !Ref GenerationPollSeconds
+          # The whole retry and poll policy. Every wait behind these suspends the
+          # execution, so patience is free; only the notice delay grows.
+          TASK_POLL_SECONDS: !Ref TaskPollSeconds
+          MAX_TASK_POLLS: "120"
+          SUBMIT_RETRY_SECONDS: "60"
+          MAX_SUBMIT_ATTEMPTS: "10"
+          MAX_IDLE_POLLS: "20"
+          MAX_LOOP_ITERATIONS: "2000"
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !Ref LambdaCodeKey
@@ -426,7 +426,9 @@ Outputs:
     Description: Function that consumes fleet size recommendation events.
     Value: !Ref ScalingFunction
   OutputBucketName:
-    Description: Bucket that Bedrock writes generated output to. Retained on stack delete.
+    Description: >-
+      Bucket the bedrock-async provider writes generated output to. Retained on stack
+      delete.
     Value: !Ref OutputBucket
   WorkerRegistryTableName:
     Description: Registry of live durable workers.
