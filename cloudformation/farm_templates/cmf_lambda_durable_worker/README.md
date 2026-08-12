@@ -71,10 +71,6 @@ Deadline Cloud does not apply to it:
   worker owns no host, acts as its own Lambda execution role, and sees only an ephemeral
   `/tmp`. A queue still needs a `jobRunAsUser` set to accept a CMF association, but the
   worker does not honor it.
-* **More than one action at a time.** A durable execution is single-threaded, so a worker
-  runs one session action at a time and cannot host concurrent sessions.
-* **Conda, Rez, and any other software delivery.** Nothing is installed; `/tmp` is the
-  only writable path and the sandbox is discarded.
 
 ## How it works
 
