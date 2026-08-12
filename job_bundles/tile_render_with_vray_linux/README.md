@@ -150,8 +150,12 @@ This job bundle automatically handles path remapping for assets using the sessio
 When you add files via Job Attachments, paths are automatically translated:
 
 - **Source path** (your workstation): `C:\Projects\MyProject\textures\`
-- **Destination path** (worker): `/sessions/.../assetroot-.../textures/`
-- **V-Ray argument**: `-remapPath='C:\Projects\MyProject\textures\=/sessions/.../assetroot-.../textures/'`
+- **Destination path** (worker): `<session directory>/<asset root>/textures/`
+- **V-Ray argument**: `-remapPath='C:\Projects\MyProject\textures\=<session directory>/<asset root>/textures/'`
+
+The worker chooses the session directory and asset root directory names at runtime.
+Neither is a stable value you can build a path from, so the script reads the
+destination out of the rules file instead of reconstructing it.
 
 ## Example Usage
 

@@ -121,6 +121,21 @@ The log output shows:
 - Video encoding for each camera
 - Grid video stitching (if multiple cameras)
 
+## Inputs and Path Mapping
+
+The bundle includes a `data/` directory holding `change_lane.osc.template` and the OSC2
+library it imports. The `ScenarioDataDir` job parameter declares that directory as a
+`PATH` parameter with `dataFlow: IN`, so job attachments uploads it at submission time
+and the worker receives the uploaded copy. `OutputDir` is declared the same way with
+`dataFlow: OUT`.
+
+Declaring both as `PATH` parameters is what lets the task script stay simple. The
+session applies its path mapping rules before it expands `{{Param.ScenarioDataDir}}`
+and `{{Param.OutputDir}}`, so both arrive as absolute worker paths and the script never
+searches the session directory or assumes a directory naming scheme. A template that
+needs the full set of rules rather than one mapped parameter can read them from the
+JSON file at `{{Session.PathMappingRulesFile}}`.
+
 ## Output Structure
 
 Each task produces output in a subdirectory named for its parameters:

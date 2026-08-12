@@ -108,6 +108,20 @@ parameterDefinitions:
       label: Rear Right
       groupLabel: Camera Viewpoints
 
+  # --- Inputs ---
+  - name: ScenarioDataDir
+    type: PATH
+    objectType: DIRECTORY
+    dataFlow: IN
+    default: ./data
+    description: |
+      Directory holding the OpenSCENARIO template and its OSC2 imports. Declaring
+      it as an IN PATH parameter makes job attachments upload it and hands the
+      task script the path-mapped worker-side directory, so the script never has
+      to search the session directory to find it.
+    userInterface:
+      control: HIDDEN
+
   # --- Output ---
   - name: OutputDir
     type: PATH
@@ -195,16 +209,16 @@ steps:
           data: |
             set -euo pipefail
 
-            # Switch to the session's asset root so relative paths like
-            # {{Param.OutputDir}} (e.g. ./outputs) resolve under the area that
-            # Deadline Cloud tracks for output uploads.
-            ASSET_ROOT=$(find /sessions -maxdepth 2 -name "assetroot-*" -type d 2>/dev/null | head -1)
-            if [[ -z "$ASSET_ROOT" ]]; then
-                echo "ERROR: could not locate asset root under /sessions"
-                exit 1
-            fi
-            cd "$ASSET_ROOT"
-            echo "Asset root: $ASSET_ROOT"
+            # PATH job parameters arrive already resolved for this worker: the
+            # submitter made them absolute, and the session applied its path
+            # mapping rules before expanding the Param references below. So
+            # these two are the real on-worker directories, wherever job
+            # attachments placed them, and nothing here has to know or guess how
+            # those directories are named.
+            DATA_DIR="{{Param.ScenarioDataDir}}"
+            OUTPUT_DIR="{{Param.OutputDir}}"
+            echo "Scenario data: $DATA_DIR"
+            echo "Output root:   $OUTPUT_DIR"
 
             EGO_SPEED="{{Task.Param.EgoSpeed}}"
             NPC_SPEED="{{Task.Param.NpcSpeed}}"
@@ -231,21 +245,18 @@ steps:
             echo "  Cameras:     ${CAMERAS}"
             echo "  Task name:   $TASK_NAME"
 
-            # Locate template (relative to assetroot, where we cd'd above)
-            TEMPLATE="$ASSET_ROOT/data/change_lane.osc.template"
+            TEMPLATE="$DATA_DIR/change_lane.osc.template"
             if [[ ! -f "$TEMPLATE" ]]; then
                 echo "ERROR: change_lane.osc.template not found at $TEMPLATE"
-                ls -la "$ASSET_ROOT/data" 2>/dev/null || true
+                ls -la "$DATA_DIR" 2>/dev/null || true
                 exit 1
             fi
-            DATA_DIR="$ASSET_ROOT/data"
             echo "Template: $TEMPLATE"
 
-            # Task-specific output dir (must be absolute for docker volume mount)
-            TASK_OUTPUT="{{Param.OutputDir}}/$TASK_NAME"
+            # Task-specific output dir. Already absolute, as docker -v requires.
+            TASK_OUTPUT="$OUTPUT_DIR/$TASK_NAME"
             mkdir -p "$TASK_OUTPUT"
             mkdir -p "$TASK_OUTPUT/video"
-            TASK_OUTPUT=$(cd "$TASK_OUTPUT" && pwd)
             echo "Task output: $TASK_OUTPUT"
 
             # Generate scenario from template

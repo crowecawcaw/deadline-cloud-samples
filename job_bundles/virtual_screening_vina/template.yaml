@@ -419,7 +419,10 @@ steps:
             if library_param.endswith("chembl"):
                 candidates = glob.glob("{{Param.OutputDir}}/compound_library.sdf*")
                 if not candidates:
-                    candidates = glob.glob("/sessions/**/compound_library.sdf*", recursive=True)
+                    # Fall back to a search of this session's directory. The session
+                    # root is configurable on the worker and differs by platform, so
+                    # ask the session for it rather than hardcoding a path.
+                    candidates = glob.glob("{{Session.WorkingDirectory}}/**/compound_library.sdf*", recursive=True)
                 library_path = candidates[0] if candidates else library_param
             else:
                 library_path = library_param
