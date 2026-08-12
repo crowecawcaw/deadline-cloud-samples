@@ -1,8 +1,8 @@
 # Bedrock generation fanout
 
-Fans out a list of video generation requests, one task each. A task here describes an
-**API call** rather than a command to run, which is what lets a suspended worker execute
-it.
+Fans out a list of prompts as one video generation request per task. The step's `onRun`
+starts an asynchronous Amazon Bedrock invocation itself, then hands the waiting to the
+worker so nothing is billed while the model works.
 
 This bundle is the companion job for the [customer-managed fleet with Lambda durable
 function workers](../../cloudformation/farm_templates/cmf_lambda_durable_worker/) sample,
@@ -14,66 +14,70 @@ and expects that fleet to be deployed and associated with your queue.
   `attr.durable.lambda`, so the scheduler assigns these tasks only to durable Lambda
   workers. The fleet must declare the same attribute. If it does not, tasks are reported
   `NOT_COMPATIBLE` and never run.
-* **The `onRun` command is not what calls the service.** A durable Lambda worker never
-  runs it. The worker reads the task parameters and calls the service itself. The embedded
-  script only echoes the request, which keeps the template valid, runnable under `openjd
-  run`, and comparable on a conventional worker.
-* **The task carries the request, not a rendering of it.** `Request` is passed to the
-  provider verbatim, so the model and every generation setting are template data. The
-  worker parses none of it.
+* **`onRun` hands off a wait.** It is an ordinary script that runs for real, and it ends by
+  printing one line:
+
+  ```text
+  durable_lambda_await: {"provider": "bedrock-async", "handle": "<invocation ARN>"}
+  ```
+
+  A durable Lambda worker reads that line, suspends, and polls the invocation until it
+  finishes, then reports the task's result from the outcome. Open Job Description defines no
+  such thing, so the line is a worker-side extension, and it avoids the reserved `openjd_`
+  prefix for that reason. Any other worker ignores it and reports the task successful as soon
+  as the script exits.
+* **The script needs the queue role.** Credentials come from the queue, not the fleet, so
+  the fleet stack's `QueueGenerationPolicyArn` has to be attached to your queue role before
+  a task can call Bedrock.
 
 ## Parameters
 
-Everything is a **task** parameter, set in the step's `parameterSpace`:
+Settings are **job** parameters. The only **task** parameter is `Prompt`, so the parameter
+space is one task per prompt.
 
-| Parameter | Value | Purpose |
-|---|---|---|
-| `Provider` | `bedrock-async` | Which provider the worker calls. `sleep` is a credential-free fake. |
-| `Request` | three JSON requests | The provider's request, passed through unchanged. One task per entry, so this range is what fans out. |
+| Parameter | Kind | Default | Purpose |
+|---|---|---|---|
+| `OutputBucket` | job | *(required)* | Bucket Bedrock writes to. Use the fleet stack's `OutputBucketName`. |
+| `OutputPrefix` | job | `generated` | Key prefix. The fleet stack expires this prefix after seven days. |
+| `ModelId` | job | `luma.ray-v2:0` | A model that supports `StartAsyncInvoke`. |
+| `Duration` | job | `5s` | Clip length, spelled as the model documents. |
+| `Resolution` | job | `540p` | Output resolution, spelled as the model documents. |
+| `AspectRatio` | job | `16:9` | Output aspect ratio, spelled as the model documents. |
+| `Prompt` | task | three prompts | One task per entry. This range is what fans out. |
 
-A `Request` for the Bedrock provider is a `modelId` and the `modelInput` that model
-expects. Both reach `StartAsyncInvoke` untouched, so `modelInput` follows whatever schema
-the chosen model documents:
+Add or remove entries in the `Prompt` range to change how many concurrent requests the fleet
+is asked to make. The number of queued tasks is what drives scale-out. Keep `Prompt` the
+only task parameter, because task parameters form a cross product: a second one would
+multiply the task count rather than change a setting.
 
-```json
-{"modelInput": {"prompt": "a slow aerial push over a misty pine forest at dawn",
- "duration": "5s", "resolution": "540p"},
- "modelId": "luma.ray-v2:0"}
-```
+Use a model that supports `StartAsyncInvoke`, which on Bedrock means the video models. Image
+models such as Amazon Nova Canvas are synchronous-only through `InvokeModel` and expose
+nothing to poll.
 
-Keep `modelId` last, or otherwise avoid `}}` anywhere in the request: Open Job Description
-reads those two braces as the end of an interpolation expression and rejects the template.
+Output goes to `s3://<OutputBucket>/<OutputPrefix>/<hash of the prompt>/`. The prefix is
+derived from the prompt so concurrent tasks cannot collide and a retried task overwrites its
+own output.
 
-Add or remove entries in the `Request` range to change how many concurrent requests the
-fleet is asked to make. The number of queued tasks is what drives scale-out. Keep
-`Provider` single-valued, because task parameters form a cross product: a second value
-would double the task count rather than change a setting.
-
-Use a model that supports `StartAsyncInvoke`, which on Bedrock means the video models.
-Image models such as Amazon Nova Canvas are synchronous-only through `InvokeModel` and
-expose nothing to poll.
-
-This template deliberately defines **no job parameters**. Task parameters reach the worker
-directly in the `taskRun` session action, but job parameters must be fetched with
-`BatchGetJobEntity`, which that sample does not implement, so a job parameter would
-silently never arrive.
+One authoring constraint worth knowing: `}}` cannot appear anywhere Open Job Description
+interpolates, because it reads those two braces as the end of an expression. The embedded
+Python builds its nested dictionaries one at a time for that reason.
 
 ## Submit
 
 ```console
-deadline bundle submit . --farm-id farm-<your-farm-id> --queue-id queue-<your-queue-id>
+deadline bundle submit . \
+  --farm-id farm-<your-farm-id> --queue-id queue-<your-queue-id> \
+  -p OutputBucket=<OutputBucketName from the fleet stack>
 ```
 
-To exercise the fleet without Bedrock model access, set the `Provider` range to
-`["sleep"]` and submit again.
-
-Check the template, or run one task locally to see the request a task carries. `Request`
-has an enumerated range, so pick a task rather than passing a value with `-tp`:
+Check the template, or run one task locally:
 
 ```console
 openjd check template.yaml
-openjd run template.yaml --step Generate --maximum-tasks 1
+openjd run template.yaml --step Generate --maximum-tasks 1 -p OutputBucket=<bucket>
 ```
 
-Bedrock writes generated files to the output bucket created by the fleet stack, under
-`generated/<taskId>/<invocationId>/`.
+`openjd run` proves the template is valid and that interpolation, the embedded files, and
+the `StartAsyncInvoke` call path all work. It leaves the wait unproven: the CLI ignores
+the await line and reports the task successful the moment the script exits. Without
+credentials the script fails cleanly with `openjd_fail:` and a Bedrock error.
