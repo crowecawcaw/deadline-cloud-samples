@@ -14,6 +14,6 @@ This table covers every immediate deployable sample directory in `farm_templates
 | [SMF capacity manager](smf_capacity_manager/) | Automated balancing of Wait and Save and Spot fleet capacity | You operate hybrid service-managed fleets |
 | [Fleet standby scheduling](fleet_standby_scheduling/) | Scheduled warm standby worker counts | Worker startup latency matters during predictable hours |
 | [CMF fleet health check](cmf_templates/) | Continuous health monitoring for an autoscaling customer-managed fleet | You need alarms for fleet capacity or health problems |
-| [CMF with Lambda durable function workers](cmf_lambda_durable_worker/) | Serverless customer-managed fleet workers that suspend without compute charges while another service works | Your workers dispatch long-running API calls instead of computing locally |
+| [CMF with Lambda durable function workers](cmf_lambda_durable_worker/) | Proof of concept: serverless workers that suspend without compute charges while another service works | You want Deadline Cloud to orchestrate API-call steps, such as video generation |
 
 [`apply-conda-queue-env.py`](apply-conda-queue-env.py) is support tooling used to apply a queue environment. It is not a separately deployable sample and is excluded from the table.

@@ -1,83 +1,80 @@
 # Customer-managed fleet with Lambda durable function workers
 
-A Deadline Cloud customer-managed fleet (CMF) whose workers are AWS Lambda durable
-functions instead of hosts. Each worker registers with the fleet, heartbeats, and
-dispatches long-running Amazon Bedrock generation requests, suspending without compute
-charges while those requests run.
+This sample runs a Deadline Cloud customer-managed fleet (CMF) whose workers are AWS
+Lambda **durable functions** instead of hosts. Each worker is one durable execution. It
+registers with the fleet, heartbeats, and, once it is given a task, dispatches a
+long-running API request and suspends, unbilled, until that request finishes.
 
-Choose this sample when your workers spend their time waiting on another service rather
-than computing locally: dispatching API calls, orchestrating model inference, or polling
-an external job. If your work needs a persistent filesystem, a GPU, or a DCC
-installation, use a conventional [Amazon EC2 customer-managed
-fleet](https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/create-auto-scaling.html)
-instead.
+It is a proof of concept for using durable Lambda as a fleet so that **Deadline Cloud can
+orchestrate workflows whose steps are API calls**, alongside the steps that render. Video
+generation is the motivating case. Here the service is Amazon Bedrock, but the worker does
+not know that: the job template picks the API to call, so the same fleet can drive an
+external service such as Seedance or fal.ai instead.
+
+Choose this pattern when a step spends its time waiting on someone else's service. If the
+work needs a filesystem, a GPU, or a DCC installation, use a conventional [Amazon EC2
+customer-managed
+fleet](https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/create-auto-scaling.html).
+
+> The worker code is illustrative rather than production grade. It implements the protocol
+> calls the concept needs and no more, and the [Not supported](#not-supported) list below
+> says what that leaves out.
 
 ## What this sample demonstrates
 
 * Implementing the Deadline Cloud **worker protocol directly**, without the
   `deadline-cloud-worker-agent` package.
-* Driving CMF capacity from **`EVENT_BASED_AUTO_SCALING`** events, where one worker is
-  one durable execution rather than one Amazon EC2 instance.
-* Using **durable waits** so a worker that is idle, or blocked on a ten-minute request,
+* Driving CMF capacity from **`EVENT_BASED_AUTO_SCALING`** events, where one worker is one
+  durable execution rather than one Amazon EC2 instance.
+* Using **durable waits**, so a worker that is idle or blocked on a ten-minute request
   costs nothing while it waits.
 * Graceful **scale-in that never abandons in-flight work**.
+* A **service-agnostic worker**: the task says which provider to call and carries that
+  provider's request verbatim.
 
-## The cost model
+## Why not a conventional worker
 
-The motivation is as much economic as architectural. When the actual work happens in
-another service, a conventional worker holds compute it is not using: an Amazon EC2
-instance or a service-managed fleet worker is billed for the whole time a job is
-assigned to it, including the minutes it spends blocked on someone else's API call. A
-durable function inverts that. The worker stays registered and keeps heartbeating, but
-suspends between calls and is billed only while it is running code.
+A worker that dispatches an API call and then waits does no local computing, yet a
+conventional worker still holds a host for the whole wait: an Amazon EC2 instance or a
+service-managed fleet worker is billed for every minute a job is assigned to it, including
+the minutes it spends blocked on another service. Because a durable function suspends
+between calls, it stays registered and keeps heartbeating while being billed only for the
+time it runs code. In a validation run of three workers generating three clips, combined
+worker lifetime was 755 seconds, of which 688 (91%) was spent suspended in durable waits.
+Billed Lambda compute came to 67 seconds across 26 invocations, roughly $0.02 per 100 clips
+at 512 MB. The Deadline Cloud CMF worker charge does not change: it applies for as long as
+a worker is registered. Neither does the external service's own bill for generation, which
+dominates the total by orders of magnitude. The saving is real only for work that spends
+its time waiting, since a worker doing local computation pays for that computation in
+Lambda too, and an instance is likely cheaper.
 
-What you pay either way:
+## Not supported
 
-| | Conventional worker | Durable Lambda worker |
-|---|---|---|
-| Deadline Cloud CMF worker usage | yes, while the worker exists | yes, while the worker exists |
-| Compute | the full worker lifetime | only the seconds spent running code |
-| The external service | its own charges | its own charges |
+The worker implements the worker protocol but no session runtime, so a good deal of
+Deadline Cloud does not apply to it:
 
-The Deadline Cloud customer-managed fleet worker charge still applies and does not
-change: a registered worker is a registered worker. What changes is the compute bill
-underneath it, and the external service's charges are unaffected either way.
-
-### A measured example
-
-Three workers generating three clips, from the run used to validate this sample:
-
-* combined worker lifetime: **755 seconds**
-* suspended in durable waits: **688 seconds (91%)**
-* billed Lambda compute: **67 seconds** across 26 invocations, or **9%** of lifetime
-
-At 512 MB in `us-west-2` that is about 33 GB-seconds, so roughly **$0.0006** in Lambda
-charges for the whole run, or about **$0.02 per 100 clips**. Compute is not the
-interesting line item at this scale, which is the point: the same three clips on a
-conventional worker would have billed an instance for all 755 seconds while it waited.
-
-Part of that 9% is the price of staying correct. A busy worker has to keep heartbeating,
-so each generation poll also calls `UpdateWorkerSchedule`; skipping those heartbeats
-looks cheaper and gets the worker marked `NOT_RESPONDING` with its task reassigned.
-
-Two caveats keep this honest. Bedrock generation dominates the total bill by orders of
-magnitude, so this pattern optimizes the smaller half of the cost. And the saving only
-appears for work that genuinely waits on another service; a worker doing local
-computation is billed for that computation whether it runs in Lambda or on an instance,
-and the instance is likely cheaper.
-
-### Two ways to lose the saving
-
-Reaching 9% took two fixes, both worth knowing if you adapt this sample, because both
-quietly turn waiting back into billed compute:
-
-* **Do not let botocore retry in process.** Its backoff sleeps inside the API call, and
-  that sleep is billed. A throttled `StartAsyncInvoke` was costing about 11 seconds of
-  billed time per attempt. Retrying behind a `context.wait()` instead makes the same
-  backoff free, and cut billed compute from 166 seconds to 91 on identical work.
-* **Cache your clients.** Building a credentialed `boto3.Session` plus client costs
-  roughly 80ms and cannot reuse botocore's warm loader cache, so a step that assumed the
-  fleet role and made one call paid it twice per network round trip.
+* **Job attachments.** The worker has no session directory to stage inputs into, and it
+  uploads no outputs. A `syncInputJobAttachments` action fails with an explanation.
+* **Queue environments that run scripts.** Only an environment's `variables` are applied.
+  A `script` fails the `envEnter` action, which stops the session rather than letting a
+  task run in an environment that was never prepared. Every environment in
+  [`queue_environments/`](../../../queue_environments/) is script-based, so none of them
+  work here.
+* **Job parameters.** Only task parameters reach the worker. Job-level parameters arrive
+  through `BatchGetJobEntity`'s `jobDetails`, which this worker never fetches, so a job
+  parameter silently does nothing. Put everything in the step's `parameterSpace`.
+* **Commands.** The step's `script`, `onRun`, and embedded files are never executed. The
+  worker reads task parameters and makes an API call. It runs no OpenJD actions.
+* **Session log streaming.** Worker output goes to the Lambda function's own log group,
+  not to the job's session logs in the Deadline Cloud monitor.
+* **Host configuration scripts, `jobRunAsUser`, path mapping, and storage profiles.** The
+  worker owns no host, acts as its own Lambda execution role, and sees only an ephemeral
+  `/tmp`. A queue still needs a `jobRunAsUser` set to accept a CMF association, but the
+  worker does not honor it.
+* **More than one action at a time.** A durable execution is single-threaded, so a worker
+  runs one session action at a time and cannot host concurrent sessions.
+* **Conda, Rez, and any other software delivery.** Nothing is installed; `/tmp` is the
+  only writable path and the sandbox is discarded.
 
 ## How it works
 
@@ -85,173 +82,125 @@ quietly turn waiting back into billed compute:
  job submitted
       │
       ▼
- Deadline Cloud ──"Fleet Size Recommendation Change"──▶ EventBridge ──▶ scaling function
-      ▲                                                                      │
-      │                                                    starts one durable execution
-      │                                                          per additional worker
-      │                                                                      ▼
-      │                                                          ┌──────────────────────┐
-      └──── CreateWorker / UpdateWorker / UpdateWorkerSchedule ───│   durable worker     │
-                                                                 │  (Lambda function)   │
-                                                                 └──────────┬───────────┘
-                                                                            │
-                                                    StartAsyncInvoke ──▶ Amazon Bedrock
-                                                            │                   │
-                                                     context.wait()       generates to S3
-                                                    (suspended, unbilled)       │
-                                                            │                   ▼
-                                                    GetAsyncInvoke ◀──── output.mp4
+ Deadline Cloud ──"Fleet Size Recommendation Change"──▶ scaling function
+      ▲                                                        │
+      │        starts one execution per worker                 │
+      │                                                        ▼
+      │                                          ┌───────────────────────────┐
+      └── CreateWorker / UpdateWorkerSchedule ───┤  durable worker (Lambda)  │
+                                                 └─────────────┬─────────────┘
+                                                               │  provider.submit()
+                                                               ▼  provider.poll()
+                                              Amazon Bedrock, or another service
+                                              (suspended, unbilled, between polls)
 ```
 
 A worker's whole life is one durable execution. It registers, then loops: call
-`UpdateWorkerSchedule` (which is simultaneously the heartbeat, the progress report, and
-the request for work), act on whatever comes back, and sleep for the interval the
-service asks for. When it receives a task it starts a Bedrock request, sleeps between
-status checks, and reports the result on its next heartbeat.
+`UpdateWorkerSchedule` (simultaneously the heartbeat, the progress report, and the request
+for work), act on whatever comes back, and suspend for the interval the service asks for.
+Given a task, it submits the request and then suspends between status polls until it can
+report the result.
 
-### Reporting results
+An EventBridge rule routes the fleet's size recommendations to the scaling function, and
+scale-out invokes more executions. Scale-in cannot pick which execution to stop, and
+`StopDurableExecution` would strand a worker mid-request, so the scaling function instead
+sets a `drain` flag on chosen workers in a small DynamoDB registry. A worker reads its
+flag on its next heartbeat, finishes any work already assigned to it, then exits through
+`STOPPING` → `STOPPED` → `DeleteWorker`. Newest workers drain first, being least likely
+to hold a long-running request.
 
-Two rules govern how results go back, and both are enforced by the service rather than
-merely recommended.
+### Swapping the service
 
-**One result per call, in the assigned order.** Reporting action 1 before action 0 is
-rejected with "comes in a wrong order", and because the rejection fails the whole request,
-batching results loses every result in the batch rather than just the offending one. So
-each action's result is sent in its own `UpdateWorkerSchedule` call as soon as it
-completes.
+The worker core contains no reference to Bedrock. A task names a provider and carries
+that provider's request as an opaque JSON string:
 
-**One failure stops the rest of its session.** The service will not run further `taskRun`,
-`envEnter`, or `syncInputJobAttachments` actions in a session once any action in it has
-failed, been canceled, or been interrupted. The remaining actions are reported
-`NEVER_ATTEMPTED`, with no timestamps, because they never started. `envExit` still runs: it
-is the session's cleanup and has to happen on the failure path too. Ignoring this rule
-means paying Bedrock for requests whose results the service discards.
+```yaml
+- name: Provider
+  type: STRING
+  range: ["bedrock-async"]
+- name: Request
+  type: STRING
+  range:
+  - >-
+    {"modelInput": {"prompt": "a red sports car on a coastal highway at sunset",
+    "duration": "5s", "resolution": "540p"},
+    "modelId": "luma.ray-v2:0"}
+```
 
-### Heartbeating while busy
+Keep `modelId` last, or otherwise avoid `}}` anywhere in the request: Open Job Description
+reads those two braces as the end of an interpolation expression and rejects the template.
 
-A worker must keep calling `UpdateWorkerSchedule` even while it is working. Stop, and the
-service concludes the worker is gone: it marks it `NOT_RESPONDING` and reassigns the
-task, so a second worker starts the same Bedrock request while the first is still
-running it, and the first worker's eventual result is rejected.
+The worker resolves the provider name and hands over the request untouched, then drives a
+generic submit-wait-poll loop. Providers implement two functions:
 
-This is easy to get wrong here. The real worker agent runs sessions on a thread pool so
-its main loop can keep heartbeating independently, but a durable execution is
-single-threaded: a wait for a ten-minute Bedrock request is a wait for everything. So the
-generation loop heartbeats on every poll, sending the action's progress with **no**
-`completedStatus`, which is how the protocol expresses "still running". That is also
-where the worker learns the service has cancelled the action, in which case it stops
-polling and reports `CANCELED` instead of paying for a result nobody is waiting for.
+```python
+def submit(request: dict, *, task_id: str) -> dict:
+    """-> {"handle": ...} | {"error": ..., "retryable": bool}"""
 
-### Why not use the worker agent
+def poll(handle) -> dict:
+    """-> {"state": "RUNNING" | "SUCCEEDED" | "FAILED", "message": ..., "outputUri": ...}"""
+```
 
-The [`deadline-cloud-worker-agent`](https://github.com/aws-deadline/deadline-cloud-worker-agent)
-assumes a long-lived process on a host it controls: it persists worker IDs to disk,
-caches credentials in local files, runs jobs as OS users in local sessions, and streams
-logs from background threads. None of that survives a function that suspends and
-replays. This sample implements only the five calls a worker actually needs —
-`CreateWorker`, `AssumeFleetRoleForWorker`, `UpdateWorker`, `UpdateWorkerSchedule`, and
-`DeleteWorker` — in [`lambda/worker_protocol.py`](lambda/worker_protocol.py).
+Retry and poll timing are the worker's policy, not the provider's; a provider only says
+whether a failure is worth retrying. Adding a service means one new module in
+[`lambda/providers/`](lambda/providers/) and one more name in its registry. The registry
+starts with `bedrock-async`, and with `sleep`, a credential-free fake that lets you
+exercise the whole fleet without Bedrock model access.
 
-The tradeoff is real: you give up job attachments, session log streaming, host
-configuration scripts, and running jobs as a specific user. That is why the job template
-here describes an API call rather than a command to execute.
+Because the model and its input are passed through verbatim, changing model, prompt,
+resolution, or duration is a job template edit with no code change.
 
-**Job parameters do not reach the worker**, only task parameters do. Job-level parameters
-arrive via `BatchGetJobEntity`'s `jobDetails`, which this sample does not fetch, so a job
-parameter would silently fall back to the function's default. The accompanying job bundle
-therefore puts everything in the step's `parameterSpace`.
+### Notes for reading the code
 
-### Queue environments
+These constraints shape the worker and are easy to break while adapting it:
 
-Deadline Cloud wraps a task in `envEnter` and `envExit` actions, one pair per queue
-environment. The worker fetches each environment's Open Job Description template with
-`BatchGetJobEntity` and then does what it can with it:
-
-* An environment that only defines **`variables`** is applied, and the variables are
-  available to the task. This covers environments that pass configuration.
-* An environment that defines a **`script`** fails the `envEnter` action with an
-  explanation naming the environment.
-
-Failing is deliberate. Every environment in
-[`queue_environments/`](../../../queue_environments/) is script-based, because their job
-is to install software onto a host: a Lambda worker has no persistent session directory,
-no writable filesystem outside `/tmp`, and none of the tools those scripts drive. The
-alternative to failing is reporting success for setup that never happened and letting the
-task run in an environment that was never prepared.
-
-One operational consequence to know about: a failed `envEnter` is retried, so a queue with
-a scripted environment and only these workers will cycle through sessions until the job's
-retry limits are exhausted rather than failing once. The message on the failed action says
-which environment is responsible. Either remove that environment from the queue, or run
-those jobs on a fleet whose workers execute scripts.
-
-**Job attachments are also unsupported**, and fail for the same reason: there is no
-session directory to stage input files into. Succeeding would let a task run expecting
-inputs that never arrived.
-
-### Writing for replay
-
-Lambda resumes a suspended durable execution by re-running the handler from the top,
-substituting stored results for completed steps. Determinism is therefore a correctness
-requirement, and the worker follows three rules:
-
-1. Everything non-deterministic or side-effecting happens inside `context.step()`, so
-   `CreateWorker` cannot register a second worker on replay.
-2. Control flow depends only on step results, never on a clock read or random value at
-   the top level of the handler.
-3. Timestamps are captured inside steps. `UpdateWorkerSchedule` requires `startedAt` on
-   any completed action, and a value read outside a checkpoint would drift each replay.
-
-Credentials are deliberately *not* checkpointed. They are far shorter-lived than a
-durable execution, so a replayed copy would usually be expired. Instead the worker wraps
-`AssumeFleetRoleForWorker` in botocore's `RefreshableCredentials` and lets botocore
-track expiry and re-assume the role while signing, which is the same mechanism the AWS
-SDKs use for instance and container credentials.
-
-### Scaling in without losing work
-
-Deadline Cloud emits a recommendation of *how many* workers a CMF should have; it never
-picks which ones to stop. Calling `StopDurableExecution` would strand a worker
-mid-request, leaving the Bedrock call running, the task unreported, and the worker
-registered until the service timed it out.
-
-Instead, the scaling function marks a `drain` flag on chosen workers in a small DynamoDB
-registry. Each worker reads its flag on its next heartbeat, finishes any work already
-assigned to it, and then exits through `STOPPING` → `STOPPED` → `DeleteWorker`. Newest
-workers drain first, since they are least likely to hold a long-running request.
+* **One result per `UpdateWorkerSchedule` call, in the order the actions were assigned.**
+  Reporting out of order is rejected with "comes in a wrong order", and the rejection
+  fails the whole request, so a batch loses every result rather than the offending one.
+* **One failure stops the rest of its session.** The service runs no further `taskRun`,
+  `envEnter`, or `syncInputJobAttachments` actions once one in the session has not
+  succeeded; the rest are reported `NEVER_ATTEMPTED` with no timestamps. `envExit` still
+  runs.
+* **A busy worker must keep heartbeating.** The real worker agent heartbeats from a
+  separate thread; a durable execution is single-threaded, so the poll loop heartbeats
+  itself with progress and no `completedStatus`. Stop, and the service marks the worker
+  `NOT_RESPONDING` and reassigns the task to someone else. That same response is where
+  cancellation is observed.
+* **Replay demands determinism.** Lambda resumes a suspended execution by re-running the
+  handler and substituting stored results, and it matches checkpoints to steps *by call
+  order*. Side effects and clock reads live inside `context.step()`, control flow depends
+  only on step results, and a retry loop varies its step arguments, or it replays the
+  first attempt's result forever. Credentials are deliberately not
+  checkpointed: `AssumeFleetRoleForWorker` is wrapped in botocore's
+  `RefreshableCredentials` so botocore renews them while signing.
 
 ## Prerequisites
 
-* A Deadline Cloud **farm**, and a **queue whose `jobRunAsUser` is set**. A CMF cannot
-  be associated with a queue that has no `jobRunAsUser`; creating one with
-  `--job-run-as-user '{"runAs":"WORKER_AGENT_USER"}'` is sufficient for this sample.
-* **Amazon Bedrock model access** for an asynchronous generation model in your Region,
-  granted in the Bedrock console.
+* A Deadline Cloud **farm**, and a **queue whose `jobRunAsUser` is set**. A CMF cannot be
+  associated with a queue without one; `--job-run-as-user '{"runAs":"WORKER_AGENT_USER"}'`
+  is enough.
+* For the Bedrock provider, **model access** for an asynchronous generation model in your
+  Region. Asynchronous invocation is what makes a sleeping worker worthwhile, and on
+  Bedrock that means the **video** models. Image models such as Amazon Nova Canvas are
+  synchronous-only through `InvokeModel` and have nothing to poll. Availability varies. In
+  `us-west-2` at the time of writing, `luma.ray-v2:0` is available and Amazon Nova Reel is
+  not:
+
+  ```console
+  aws bedrock list-foundation-models --region us-west-2 \
+    --query "modelSummaries[?contains(outputModalities,'VIDEO')].[modelId]" --output table
+  ```
+
 * Permission to create IAM roles, Lambda functions, DynamoDB tables, S3 buckets,
   EventBridge rules, SQS queues, and Deadline Cloud fleets.
 * The AWS CLI, Python 3, and `zip`.
 
-### Model availability
-
-Asynchronous invocation is what makes a sleeping worker worthwhile, and on Bedrock that
-means the **video** generation models. Bedrock's **image** models, including Amazon Nova
-Canvas, are synchronous-only through `InvokeModel`: they return an image inline in
-seconds and have no async invocation to poll.
-
-Availability varies by Region. In `us-west-2` at the time of writing, `luma.ray-v2:0`
-is the available video model; Amazon Nova Reel is not. Check before deploying:
-
-```console
-aws bedrock list-foundation-models --region us-west-2 \
-  --query "modelSummaries[?contains(outputModalities,'VIDEO')].[modelId]" --output table
-```
-
 ## Setup
 
-`deploy.sh` packages the Lambda source, bundles the durable execution SDK, uploads the
-package, and deploys the stack. CloudFormation cannot upload local source itself, and
-the worker function needs its real code before a version is published, so use the
-script rather than deploying the template directly.
+`deploy.sh` builds the deployment package from the Lambda source plus the durable
+execution SDK. It stages the package in S3 and then deploys the stack. Use it rather than
+deploying the template directly: CloudFormation cannot upload local source, and the worker
+function needs its real code before a version is published.
 
 ```console
 ./deploy.sh --farm-id farm-<your-farm-id>
@@ -270,12 +219,12 @@ aws deadline create-queue-fleet-association \
 Useful options:
 
 ```console
-./deploy.sh --farm-id farm-xxx --model-id luma.ray-v2:0 --max-workers 10 --region us-west-2
+./deploy.sh --farm-id farm-xxx --max-workers 10 --region us-west-2
 ```
 
 ## Run or submit
 
-Submit the accompanying job bundle. Each prompt in the template becomes one task, and
+Submit the accompanying job bundle. Each `Request` in the template becomes one task, and
 the number of queued tasks is what drives the fleet's scale-out recommendation.
 
 ```console
@@ -283,8 +232,11 @@ deadline bundle submit ../../../job_bundles/bedrock_generation_fanout \
   --farm-id farm-<your-farm-id> --queue-id queue-<your-queue-id>
 ```
 
-Watch a worker's lifecycle, including its suspensions, in the Lambda console under
-**Durable executions**, or from the CLI:
+To watch the fleet work without Bedrock access, change the bundle's `Provider` range to
+`["sleep"]` and submit that.
+
+Watch a worker's lifecycle, including its suspensions, under **Durable executions** in
+the Lambda console, or from the CLI:
 
 ```console
 aws lambda list-durable-executions-by-function \
@@ -294,7 +246,7 @@ aws lambda get-durable-execution-history \
   --durable-execution-arn <arn> --region us-west-2
 ```
 
-`WaitStarted` and `WaitSucceeded` pairs in the history are the intervals during which
+`WaitStarted` and `WaitSucceeded` pairs in the history bracket the intervals during which
 the worker was suspended and unbilled.
 
 ## Parameters and outputs
@@ -303,45 +255,48 @@ the worker was suspended and unbilled.
 |---|---|---|
 | `FarmId` | *(required)* | Farm to create the fleet in |
 | `FleetName` | `DurableLambdaFleet` | Fleet display name |
-| `MaxWorkerCount` | `5` | Caps concurrent workers, Bedrock concurrency, and cost |
-| `ModelId` | `luma.ray-v2:0` | Async-capable Bedrock model to invoke |
-| `GenerationPollSeconds` | `30` | Sleep between checks on an in-flight request |
+| `MaxWorkerCount` | `5` | Caps concurrent workers, request concurrency, and cost |
+| `TaskPollSeconds` | `30` | Sleep between checks on an in-flight request |
 
-Several further limits are code defaults rather than stack parameters, so changing them
-means editing the template's `Environment` block: `SUBMIT_RETRY_SECONDS` (60) and
-`MAX_SUBMIT_ATTEMPTS` (10) bound how long a throttled submit waits before retrying;
-`MAX_GENERATION_POLLS` (120) bounds how long a request may run; `MAX_IDLE_POLLS` (20,
-about five minutes) is how long an idle worker waits before deleting itself, which is
-the one to raise for bursty jobs; and `REGISTRY_TTL_SECONDS` (48 hours) expires the
-registry row of a worker that died without deregistering. Raising any of the wait
-intervals costs nothing, because the waits are suspended.
+The rest of the retry and poll policy sits in the template's `Environment` block rather
+than as stack parameters. `SUBMIT_RETRY_SECONDS` (60) and `MAX_SUBMIT_ATTEMPTS` (10) bound
+how long a throttled submit waits before retrying, `MAX_TASK_POLLS` (120) bounds how long
+one request may run, `MAX_IDLE_POLLS` (20, roughly five minutes) is how long an idle worker
+waits before deleting itself and is the one to raise for bursty jobs, and
+`MAX_LOOP_ITERATIONS` (2000) caps a single worker's schedule polls. Raising a wait interval
+costs nothing, because the waits are suspended.
+
+`REGISTRY_TTL_SECONDS` (48 hours) and the Bedrock provider's `OUTPUT_PREFIX`
+(`generated`) are module defaults with no entry in the template. The first expires the
+registry row of a worker that died without deregistering. The second has to match the
+output bucket's lifecycle rule if you change it.
 
 Stack outputs give the `FleetId`, the worker function alias ARN, the scaling function
-name, the output bucket, and the registry table. Generated files land in
+name, the output bucket, and the registry table. Bedrock writes generated files to
 `s3://<OutputBucket>/generated/<taskId>/<invocationId>/output.mp4`.
 
-The fleet declares a custom `attr.durable.lambda` capability, and the job template
+The fleet declares a custom `attr.durable.lambda` capability and the job template
 requires it. Both halves are needed: without the fleet declaring it, tasks are reported
 `NOT_COMPATIBLE` and never scheduled.
 
 ## Security, cost, and cleanup
 
-Roles follow the split the worker agent uses on Amazon EC2. The function's execution
-role holds only `deadline:CreateWorker` and `deadline:AssumeFleetRoleForWorker`;
-everything afterward uses the worker-scoped fleet role. Two grants are easy to miss
-because the managed policies do not include them: the fleet role needs
-`logs:CreateLogStream` (Deadline Cloud creates the worker's log stream during the
-transition to `STARTED`, and without it the worker never leaves `CREATED`) and
-`deadline:DeleteWorker` (so a drained worker can deregister). Note also that
-`CreateWorker`, `ListWorkers`, and `DeleteWorker` authorize against the *worker*
-resource, so their ARNs end in `/worker/*`.
+Roles follow the split the worker agent uses on Amazon EC2. The function's execution role
+holds only `deadline:CreateWorker` and `deadline:AssumeFleetRoleForWorker`; everything
+afterward uses the worker-scoped fleet role. The managed policies leave out grants that the
+fleet role still needs, which is easy to miss: `logs:CreateLogStream` (Deadline Cloud
+creates the worker's log stream during the transition to `STARTED`, and without it the
+worker never leaves `CREATED`), `deadline:DeleteWorker` so a drained worker can deregister,
+and `deadline:BatchGetJobEntity` to read queue environments. Note that `CreateWorker`,
+`ListWorkers`, and `DeleteWorker` authorize against the *worker* resource, so their ARNs
+end in `/worker/*`.
 
-Costs are broken down in [The cost model](#the-cost-model) above: Bedrock generation
+On cost, see [Why not a conventional worker](#why-not-a-conventional-worker): generation
 dominates, with Lambda compute for the brief active periods, Deadline Cloud CMF worker
 usage, and DynamoDB and S3 at negligible volume. `MaxWorkerCount` is the concurrency and
 cost ceiling. Bedrock's per-account concurrency limits for generation models are low, so
-several workers starting at once will hit throttling; the worker retries behind a durable
-wait rather than failing the task, which is why the retry is unbilled.
+concurrent workers will be throttled. The worker then retries behind a durable wait, which
+is unbilled, rather than failing the task.
 
 To clean up:
 
@@ -352,7 +307,7 @@ aws deadline delete-queue-fleet-association \
 aws cloudformation delete-stack --stack-name deadline-durable-lambda-worker --region us-west-2
 ```
 
-The output bucket is retained deliberately so generated files outlive the stack; delete
+The output bucket is retained deliberately, so generated files outlive the stack. Delete
 it and the artifacts bucket by hand when you no longer need them.
 
 ## Files
@@ -361,22 +316,24 @@ it and the artifacts bucket by hand when you no longer need them.
 |---|---|
 | [`deadline-durable-lambda-worker.yaml`](deadline-durable-lambda-worker.yaml) | Fleet, functions, registry, scaling rule, and IAM |
 | [`deploy.sh`](deploy.sh) | Packages the Lambda source and deploys the stack |
-| [`lambda/durable_worker.py`](lambda/durable_worker.py) | The durable worker: registration, heartbeat loop, task execution |
+| [`lambda/durable_worker.py`](lambda/durable_worker.py) | Registration, heartbeat loop, and the generic submit-wait-poll driver |
 | [`lambda/worker_protocol.py`](lambda/worker_protocol.py) | Deadline Cloud worker protocol client |
-| [`lambda/bedrock_task.py`](lambda/bedrock_task.py) | Maps task parameters to async Bedrock requests |
+| [`lambda/providers/`](lambda/providers/) | Provider registry, the Bedrock provider, and the `sleep` fake |
 | [`lambda/scaling_handler.py`](lambda/scaling_handler.py) | Turns scaling events into worker executions |
 | [`lambda/queue_environment.py`](lambda/queue_environment.py) | Applies a queue environment's variables, refuses its scripts |
 | [`lambda/worker_registry.py`](lambda/worker_registry.py) | Live-worker registry and drain flag |
-| [`tests/`](tests/) | Unit tests: data transformations, scaling arithmetic, registry, and worker loop exit paths |
-
-Run the tests with:
+| [`tests/`](tests/) | Unit tests: provider seam, scaling arithmetic, registry, worker loop exit paths |
 
 ```console
 python3 -m unittest discover -s tests
 ```
 
-The tests need no credentials and make no AWS calls. They cover the scaling
-arithmetic, the drain registry, and the worker loop's exit paths, including a
-regression guard that a drain finishes work already assigned to it. Because the
-durable execution SDK is stubbed, they verify loop control flow and data handling
-rather than checkpoint and replay behavior, which only a live run exercises.
+The tests need no credentials and make no AWS calls. Because the durable execution SDK is
+stubbed, they cover loop control flow and data handling rather than checkpoint and replay
+behavior, which only a live run exercises.
+
+## Related resources
+
+* [Customer-managed fleets](https://docs.aws.amazon.com/deadline-cloud/latest/userguide/manage-cmf.html)
+* [Bedrock generation fanout job bundle](../../../job_bundles/bedrock_generation_fanout/) (the companion job)
+* [`deadline-cloud-worker-agent`](https://github.com/aws-deadline/deadline-cloud-worker-agent) (the conventional worker this sample replaces)
