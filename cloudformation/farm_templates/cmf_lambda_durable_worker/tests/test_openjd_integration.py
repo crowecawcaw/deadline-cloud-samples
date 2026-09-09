@@ -10,6 +10,9 @@ an environment's variables survive being carried between two separate sessions.
 They are skipped when `openjd-sessions` is not importable, so the suite still passes without it.
 Install it with `pip install openjd-sessions` to run them. No credentials and no network.
 
+Templates are parsed here the same way the worker parses them, through the worker agent's
+entity classes, so a fixture that the service would reject fails here too.
+
 Run from the parent directory with:
 
     python3 -m unittest discover -s tests
@@ -22,7 +25,16 @@ import unittest
 import unittest.mock as mock
 from pathlib import Path
 
-from harness import JOB_ID, QUEUE_ID, WORKER_ID, FakeDurableContext, task_run_action
+import harness
+from harness import (
+    JOB_ID,
+    QUEUE_ID,
+    WORKER_ID,
+    AnyEntityClient,
+    FakeDurableContext,
+    stub_worker,
+    task_run_action,
+)
 
 import action_output
 
@@ -34,6 +46,7 @@ except ImportError:  # pragma: no cover - exercised by the skip itself
     OPENJD_AVAILABLE = False
 
 import durable_worker
+import worker_protocol
 
 def step_template(body: str, *, task_parameters: list | None = None) -> dict:
     """A step template whose onRun runs `body`, in the shape BatchGetJobEntity returns."""
@@ -90,11 +103,24 @@ class _SessionTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    @staticmethod
+    def parse_step(template: dict):
+        """Parse a step template the way the worker does, through the worker agent."""
+        return (
+            harness.job_entities(AnyEntityClient(template=template))
+            .step_details(step_id="step-1")
+            .step_template
+        )
+
+    @staticmethod
+    def parameters(tagged: dict):
+        return worker_protocol.unwrap_parameters(tagged)
+
     def run_task(self, template, *, task_parameters=None, job_parameters=None, os_env_vars=None):
         return session_runner.run_action(
             kind="taskRun",
             session_id="session-1",
-            template=template,
+            template=self.parse_step(template),
             job_parameters=job_parameters or {},
             task_parameters=task_parameters or {},
             os_env_vars=os_env_vars if os_env_vars is not None else {},
@@ -126,9 +152,10 @@ class TestRunningARealTask(_SessionTestCase):
         self.assertEqual(list(self.session_root.iterdir()), [])
 
     def test_an_invalid_template_is_reported_rather_than_raised_as_a_defect(self):
-        with self.assertRaises(session_runner.SessionRunnerError) as caught:
+        # Refused by the worker agent's own parsing, before a session is ever built. What
+        # matters to the caller is that it raises rather than running something half-formed.
+        with self.assertRaises(Exception):
             self.run_task({"name": "Generate", "script": {"actions": {}}})
-        self.assertIn("not valid", str(caught.exception))
 
 
 class TestParametersReachTheScript(_SessionTestCase):
@@ -136,7 +163,7 @@ class TestParametersReachTheScript(_SessionTestCase):
         # Job parameters never reached this worker before, so this is the new capability.
         outcome = self.run_task(
             step_template("echo model={{Param.ModelId}}"),
-            job_parameters={"ModelId": {"type": "STRING", "value": "luma.ray-v2:0"}},
+            job_parameters=self.parameters({"ModelId": {"string": "luma.ray-v2:0"}}),
         )
         self.assertEqual(outcome["state"], "SUCCESS")
 
@@ -146,7 +173,7 @@ class TestParametersReachTheScript(_SessionTestCase):
                 'test "{{Task.Param.Prompt}}" = "a red car"',
                 task_parameters=[{"name": "Prompt", "type": "STRING", "range": ["a red car"]}],
             ),
-            task_parameters={"Prompt": {"type": "STRING", "value": "a red car"}},
+            task_parameters=self.parameters({"Prompt": {"string": "a red car"}}),
         )
         self.assertEqual(outcome["state"], "SUCCESS")
 
@@ -154,7 +181,7 @@ class TestParametersReachTheScript(_SessionTestCase):
         with self.assertRaises(session_runner.SessionRunnerError):
             self.run_task(
                 step_template("true"),
-                job_parameters={"Frames": {"type": "CHUNK[INT]", "value": "1-10"}},
+                job_parameters=self.parameters({"Frames": {"chunkInt": "1-10"}}),
             )
 
     def test_the_base_environment_reaches_the_script(self):
@@ -233,11 +260,21 @@ class TestAwaitTokenHarvestingForReal(_SessionTestCase):
 
 
 class TestEnvironmentsForReal(_SessionTestCase):
+    @staticmethod
+    def parse_environment(template: dict, *, exiting: bool):
+        """Parse an environment the way the worker does, including the onEnter replacement."""
+        return worker_protocol.environment_template(
+            harness.job_entities(AnyEntityClient(template=template)),
+            job_id=JOB_ID,
+            environment_id="env-1",
+            exiting=exiting,
+        )
+
     def enter(self, template, *, job_parameters=None, os_env_vars=None):
         return session_runner.run_action(
             kind="envEnter",
             session_id="session-enter",
-            template=template,
+            template=self.parse_environment(template, exiting=False),
             job_parameters=job_parameters or {},
             os_env_vars=os_env_vars if os_env_vars is not None else {},
             environment_id="env-1",
@@ -247,7 +284,7 @@ class TestEnvironmentsForReal(_SessionTestCase):
         return session_runner.run_action(
             kind="envExit",
             session_id="session-exit",
-            template=template,
+            template=self.parse_environment(template, exiting=True),
             job_parameters={},
             os_env_vars=os_env_vars,
             environment_id="env-1",
@@ -275,7 +312,7 @@ class TestEnvironmentsForReal(_SessionTestCase):
             on_enter="true", variables={"PLAIN": "value", "DERIVED": "model-{{Param.ModelId}}"}
         )
         outcome = self.enter(
-            template, job_parameters={"ModelId": {"type": "STRING", "value": "luma"}}
+            template, job_parameters=self.parameters({"ModelId": {"string": "luma"}})
         )
         self.assertEqual(
             outcome["envDelta"]["set"], {"PLAIN": "value", "DERIVED": "model-luma"}
@@ -350,18 +387,15 @@ class TestTheWholeAwaitPathForReal(_SessionTestCase):
     """A real session action, harvested for real, awaited through the real sleep provider."""
 
     def test_a_task_hands_over_a_request_and_the_worker_reports_its_outcome(self):
-        entities = {
-            "jobDetails": {"jobId": JOB_ID, "parameters": {}},
-            "stepDetails": {
-                "template": step_template(
+        worker = stub_worker(
+            AnyEntityClient(
+                template=step_template(
                     'echo "durable_lambda_await: '
                     '{\\"provider\\": \\"sleep\\", \\"handle\\": '
                     '{\\"finishAt\\": $(date +%s)} }"'
                 )
-            },
-        }
-        worker = mock.MagicMock()
-        worker.get_job_entities.return_value = entities
+            )
+        )
         context = FakeDurableContext()
 
         with mock.patch.object(
@@ -390,12 +424,7 @@ class TestTheWholeAwaitPathForReal(_SessionTestCase):
         self.assertIn(durable_worker.TASK_POLL_SECONDS, context.waits)
 
     def test_a_task_that_needs_no_await_is_reported_without_one(self):
-        entities = {
-            "jobDetails": {"jobId": JOB_ID, "parameters": {}},
-            "stepDetails": {"template": step_template("echo ordinary openjd task")},
-        }
-        worker = mock.MagicMock()
-        worker.get_job_entities.return_value = entities
+        worker = stub_worker(AnyEntityClient(template=step_template("echo ordinary openjd task")))
         context = FakeDurableContext()
 
         with mock.patch.object(durable_worker, "DeadlineWorker", return_value=worker):

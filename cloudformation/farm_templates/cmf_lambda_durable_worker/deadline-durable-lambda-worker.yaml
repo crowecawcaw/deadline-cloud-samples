@@ -322,6 +322,12 @@ Resources:
           MAX_TASK_POLLS: "120"
           MAX_IDLE_POLLS: "20"
           MAX_LOOP_ITERATIONS: "2000"
+          # How long one API request may spend on the worker agent's in-process retries
+          # before the worker waits, unbilled, and asks again. Well inside the Timeout above.
+          REQUEST_RETRY_BUDGET_SECONDS: "30"
+          # The worker agent can emit usage telemetry. A sample must not do that without
+          # being asked, so it is switched off here as well as in the code.
+          DEADLINE_CLOUD_TELEMETRY_OPT_OUT: "true"
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !Ref LambdaCodeKey

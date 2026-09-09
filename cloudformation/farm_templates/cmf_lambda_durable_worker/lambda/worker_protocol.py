@@ -1,49 +1,179 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-"""Minimal AWS Deadline Cloud worker protocol client.
+"""This worker's Deadline Cloud identity, and the protocol calls it makes on its own behalf.
 
-`deadline-cloud-worker-agent` assumes a long-lived process on a host it owns, so this
-implements the wire protocol directly instead: CreateWorker, AssumeFleetRoleForWorker,
-AssumeQueueRoleForWorker, UpdateWorker, UpdateWorkerSchedule, BatchGetJobEntity,
-DeleteWorker. Every method is a plain request/response call, which leaves callers free to
-wrap each one in a durable step.
+The protocol itself comes from `deadline-cloud-worker-agent`: its `api_models` request and
+response shapes, its `aws.deadline` call wrappers with their error taxonomy, and its
+`JobEntities` fetching, batching, and caching. What is left in this module is only what the
+agent has no notion of, which is a worker whose every call has to fit inside one Lambda
+invocation.
+
+Deliberately unused from that package: its scheduler, its entrypoint, its `Worker`, and
+`log_sync.cloudwatch`. Importing any of its modules loads all of them anyway, because
+`deadline_worker_agent/__init__.py` imports them itself.
 """
 
 from __future__ import annotations
 
+import copy
+import functools
+import inspect
 import logging
 import os
-from typing import Any, Optional
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator, Optional
 
 import boto3
 import botocore.session
 from botocore.config import Config
 from botocore.credentials import RefreshableCredentials
 
+# The agent builds a TelemetryClient the first time one of its record_*_telemetry_event
+# functions is called, and that client reads this variable once, when it is constructed.
+# Nothing below reaches one, but a public sample must not be one refactor away from emitting
+# telemetry nobody asked for. setdefault leaves a deployer free to opt back in.
+os.environ.setdefault("DEADLINE_CLOUD_TELEMETRY_OPT_OUT", "true")
+
+from deadline_worker_agent.api_models import (  # noqa: E402  (after the opt-out above)
+    AwsCredentials,
+    EnvironmentDetailsIdentifier,
+    EnvironmentDetailsIdentifierFields,
+    HostProperties,
+    JobDetailsIdentifier,
+    JobDetailsIdentifierFields,
+    StepDetailsIdentifier,
+    StepDetailsIdentifierFields,
+    UpdatedSessionActionInfo,
+    UpdateWorkerScheduleResponse,
+    WorkerStatus,
+)
+from deadline_worker_agent.aws import deadline as protocol  # noqa: E402
+from deadline_worker_agent.aws.deadline import (  # noqa: E402
+    DeadlineRequestConditionallyRecoverableError,
+    DeadlineRequestError,
+    DeadlineRequestInterrupted,
+    DeadlineRequestRecoverableError,
+    DeadlineRequestUnrecoverableError,
+    DeadlineRequestWorkerNotFound,
+    DeadlineRequestWorkerOfflineError,
+)
+from deadline_worker_agent.boto import DeadlineClient  # noqa: E402
+from deadline_worker_agent.capabilities import Capabilities  # noqa: E402
+from deadline_worker_agent.sessions.job_entities import EnvironmentDetails, JobEntities  # noqa: E402
+from deadline_worker_agent.sessions.job_entities.job_details import (  # noqa: E402
+    parameters_from_api_response,
+)
+
 logger = logging.getLogger(__name__)
+
+# A deleted worker and one the service has taken out of STARTED have the same remedy here,
+# which is to stop cleanly and deregister rather than keep polling.
+WORKER_UNUSABLE = (DeadlineRequestWorkerNotFound, DeadlineRequestWorkerOfflineError)
+
+# UpdateWorker reports a missing worker as conditionally recoverable rather than as
+# DeadlineRequestWorkerNotFound, so a drain has to read that class as "already gone" too.
+WORKER_UNDRAINABLE = (
+    DeadlineRequestWorkerNotFound,
+    DeadlineRequestConditionallyRecoverableError,
+)
 
 # The session directory lives in /tmp, whose size Lambda configures separately from memory
 # and does not report to the function.
 SCRATCH_MIB = int(os.environ.get("EPHEMERAL_STORAGE_MIB", "512"))
 
-# Few attempts on purpose: botocore's backoff sleeps inside the call, and in Lambda that
-# sleep is billed compute. Long backoff belongs behind a durable wait, which is unbilled.
-DEADLINE_BOTOCORE_CONFIG = Config(retries={"max_attempts": 2, "mode": "standard"})
+# Bound on the agent's own retry loops, which are `while True` with no attempt cap. In
+# Lambda an unbounded retry consumes the whole invocation timeout and then replays the
+# step, so every call below runs under this budget instead.
+REQUEST_RETRY_BUDGET_SECONDS = float(os.environ.get("REQUEST_RETRY_BUDGET_SECONDS", "30"))
+
+# One attempt on purpose: the agent's wrappers classify and retry Deadline Cloud errors
+# themselves, and a second botocore attempt would only add a sleep inside the call, which
+# in Lambda is billed compute. The timeouts matter as much: the budget above cannot
+# interrupt a request already in flight, so botocore's own default 60s is what would
+# actually bound one.
+DEADLINE_BOTOCORE_CONFIG = Config(
+    retries={"max_attempts": 1, "mode": "standard"}, connect_timeout=5, read_timeout=15
+)
 
 
-class WorkerProtocolError(Exception):
-    """A worker protocol call failed in a way the caller cannot recover from."""
+# -- bounded requests -------------------------------------------------------------
 
 
-class WorkerNotUsableError(WorkerProtocolError):
-    """This worker can no longer do work, whatever the reason.
+_budget: Optional[threading.Event] = None
 
-    Covers a deleted worker and one the service has taken out of STARTED. Both have the
-    same remedy, which is to stop cleanly and deregister rather than keep polling.
+
+@contextmanager
+def _retry_budget() -> Iterator[threading.Event]:
+    """Give the agent's retry loops a deadline, and leave no thread behind.
+
+    A nested call shares the outermost budget: a credential refresh happens inside another
+    request, and two independent budgets would allow twice the intended delay.
+    """
+    global _budget
+    if _budget is not None:
+        yield _budget
+        return
+
+    event = threading.Event()
+    timer = threading.Timer(REQUEST_RETRY_BUDGET_SECONDS, event.set)
+    timer.daemon = True
+    timer.start()
+    # Four of the seven wrappers accept no interrupt_event, so the `sleep` they hold as a
+    # module global is the only place their loop can be stopped.
+    unbounded_sleep = protocol.sleep
+    protocol.sleep = _budgeted_sleep(event)
+    _budget = event
+    try:
+        yield event
+    finally:
+        _budget = None
+        protocol.sleep = unbounded_sleep
+        # A live timer thread is frozen with this invocation and thaws inside a later one,
+        # so it has to be gone before the handler returns or suspends.
+        timer.cancel()
+        timer.join()
+
+
+def _budgeted_sleep(event: threading.Event) -> Callable[[float], None]:
+    """A `sleep` that gives up rather than waiting past the budget."""
+
+    def sleep(delay: float) -> None:
+        if event.wait(delay):
+            raise DeadlineRequestInterrupted(
+                f"Gave up retrying after {REQUEST_RETRY_BUDGET_SECONDS}s"
+            )
+
+    return sleep
+
+
+@functools.lru_cache(maxsize=None)
+def _accepts_interrupt(call: Callable[..., Any]) -> bool:
+    return "interrupt_event" in inspect.signature(call).parameters
+
+
+def request(call: Callable[..., Any], **kwargs: Any) -> Any:
+    """Make one protocol call, retrying no longer than the request budget allows.
+
+    Raises:
+        DeadlineRequestInterrupted: the budget ran out while the agent was still retrying.
+    """
+    with _retry_budget() as event:
+        if _accepts_interrupt(call):
+            kwargs["interrupt_event"] = event
+        return call(**kwargs)
+
+
+@dataclass(frozen=True)
+class _FleetLocation:
+    """The two attributes the agent's CreateWorker and DeleteWorker read off its config.
+
+    A real `Configuration` is built from worker.toml and the agent's own command line,
+    neither of which exists in a function.
     """
 
-
-class WorkerDeletedError(WorkerNotUsableError):
-    """The service no longer recognizes this worker."""
+    farm_id: str
+    fleet_id: str
 
 
 class DeadlineWorker:
@@ -56,7 +186,7 @@ class DeadlineWorker:
         fleet_id: str,
         region: str,
         worker_id: Optional[str] = None,
-        credentials: Optional[dict[str, Any]] = None,
+        credentials: Optional[AwsCredentials] = None,
     ) -> None:
         self.farm_id = farm_id
         self.fleet_id = fleet_id
@@ -88,8 +218,8 @@ class DeadlineWorker:
         """
         if self._worker_credentials is None:
             if not self.worker_id:
-                raise WorkerProtocolError(
-                    "A worker ID is required before the fleet role can be assumed."
+                raise DeadlineRequestUnrecoverableError(
+                    ValueError("A worker ID is required before the fleet role can be assumed.")
                 )
             self.assume_fleet_role()
         client = self._client_cache.get(True)
@@ -102,13 +232,14 @@ class DeadlineWorker:
             self._client_cache[True] = client
         return client
 
-    def _client(self, *, use_worker_credentials: bool):
-        return self._worker_client() if use_worker_credentials else self._bootstrap_client()
-
     def _fetch_fleet_role_credentials(self) -> dict[str, Any]:
         """Call AssumeFleetRoleForWorker, keyed the way RefreshableCredentials expects."""
-        response = self._bootstrap_client().assume_fleet_role_for_worker(
-            farmId=self.farm_id, fleetId=self.fleet_id, workerId=self.worker_id
+        response = request(
+            protocol.assume_fleet_role_for_worker,
+            deadline_client=self._bootstrap_client(),
+            farm_id=self.farm_id,
+            fleet_id=self.fleet_id,
+            worker_id=self.worker_id,
         )
         credentials = response["credentials"]
         logger.info("Obtained fleet role credentials for worker %s", self.worker_id)
@@ -116,18 +247,18 @@ class DeadlineWorker:
             "access_key": credentials["accessKeyId"],
             "secret_key": credentials["secretAccessKey"],
             "token": credentials["sessionToken"],
-            "expiry_time": credentials["expiration"].isoformat(),
+            "expiry_time": _as_iso(credentials["expiration"]),
         }
 
     # -- lifecycle -------------------------------------------------------------
 
     def create_worker(self, *, host_name: str) -> str:
         """Register a new worker with the fleet and return its worker ID."""
-        client = self._client(use_worker_credentials=False)
-        response = client.create_worker(
-            farmId=self.farm_id,
-            fleetId=self.fleet_id,
-            hostProperties={"hostName": host_name},
+        response = request(
+            protocol.create_worker,
+            deadline_client=self._bootstrap_client(),
+            config=_FleetLocation(self.farm_id, self.fleet_id),
+            host_properties=HostProperties(hostName=host_name),
         )
         self.worker_id = response["workerId"]
         logger.info("Created worker %s in fleet %s", self.worker_id, self.fleet_id)
@@ -145,7 +276,7 @@ class DeadlineWorker:
             method="deadline-assume-fleet-role-for-worker",
         )
 
-    def set_credentials(self, credentials: dict[str, Any]) -> None:
+    def set_credentials(self, credentials: AwsCredentials) -> None:
         """Adopt credentials in the API's own spelling, keeping them refreshable."""
         self._worker_credentials = RefreshableCredentials.create_from_metadata(
             metadata={
@@ -160,172 +291,186 @@ class DeadlineWorker:
         self._client_cache.pop(True, None)
 
     def update_worker_status(
-        self, *, status: str, capabilities: Optional[dict[str, Any]] = None
+        self, *, status: WorkerStatus, capabilities: Optional[Capabilities] = None
     ) -> dict[str, Any]:
         """Move the worker to STARTED, STOPPING, or STOPPED.
 
         `capabilities` is required on the transition to STARTED.
         """
-        client = self._client(use_worker_credentials=True)
-        request: dict[str, Any] = {
-            "farmId": self.farm_id,
-            "fleetId": self.fleet_id,
-            "workerId": self.worker_id,
-            "status": status,
-        }
-        if capabilities:
-            request["capabilities"] = capabilities
-        try:
-            return client.update_worker(**request)
-        except client.exceptions.ResourceNotFoundException as exc:
-            raise WorkerDeletedError(f"Worker {self.worker_id} no longer exists") from exc
+        return request(
+            protocol.update_worker,
+            deadline_client=self._worker_client(),
+            farm_id=self.farm_id,
+            fleet_id=self.fleet_id,
+            worker_id=self.worker_id,
+            status=status,
+            capabilities=capabilities,
+        )
 
     def update_worker_schedule(
-        self, *, updated_session_actions: Optional[dict[str, Any]] = None
-    ) -> dict[str, Any]:
+        self, *, updated_session_actions: Optional[dict[str, UpdatedSessionActionInfo]] = None
+    ) -> UpdateWorkerScheduleResponse:
         """Heartbeat, report action progress, and receive assigned work.
 
         The response carries `assignedSessions`, `cancelSessionActions`, an optional
         `desiredWorkerStatus`, and `updateIntervalSeconds`.
         """
-        client = self._client(use_worker_credentials=True)
-        try:
-            return client.update_worker_schedule(
-                farmId=self.farm_id,
-                fleetId=self.fleet_id,
-                workerId=self.worker_id,
-                # botocore serializes ISO-8601 strings for timestamp members, so results
-                # can cross a JSON checkpoint boundary without conversion.
-                updatedSessionActions=updated_session_actions or {},
-            )
-        except client.exceptions.ResourceNotFoundException as exc:
-            raise WorkerDeletedError(f"Worker {self.worker_id} no longer exists") from exc
-        except client.exceptions.ConflictException as exc:
-            raise WorkerNotUsableError(
-                f"Worker {self.worker_id} is no longer in the STARTED status"
-            ) from exc
+        return request(
+            protocol.update_worker_schedule,
+            deadline_client=self._worker_client(),
+            farm_id=self.farm_id,
+            fleet_id=self.fleet_id,
+            worker_id=self.worker_id,
+            # botocore serializes ISO-8601 strings for timestamp members, so results can
+            # cross a JSON checkpoint boundary without conversion.
+            updated_session_actions=updated_session_actions or {},
+        )
 
-    def assume_queue_role(self, *, queue_id: str) -> dict[str, Any]:
+    def assume_queue_role(self, *, queue_id: str) -> AwsCredentials:
         """Obtain the queue role credentials a job's own scripts run with.
 
         This is how a real worker keeps a task's code off the worker's own identity. Not
         checkpointed: these are shorter-lived than a durable execution.
         """
-        client = self._client(use_worker_credentials=True)
-        try:
-            response = client.assume_queue_role_for_worker(
-                farmId=self.farm_id,
-                fleetId=self.fleet_id,
-                workerId=self.worker_id,
-                queueId=queue_id,
-            )
-        except client.exceptions.ResourceNotFoundException as exc:
-            raise WorkerDeletedError(f"Worker {self.worker_id} no longer exists") from exc
+        response = request(
+            protocol.assume_queue_role_for_worker,
+            deadline_client=self._worker_client(),
+            farm_id=self.farm_id,
+            fleet_id=self.fleet_id,
+            worker_id=self.worker_id,
+            queue_id=queue_id,
+        )
         return response["credentials"]
 
-    def get_job_entities(self, *, identifiers: list[dict[str, Any]]) -> dict[str, Any]:
-        """Fetch job, step, and environment entities in one call, keyed by their kind.
+    def job_entities(self, *, job_id: str) -> JobEntities:
+        """The agent's entity fetcher, which batches, caches, and validates for us.
 
-        One call rather than several because each is a round trip inside a billed
-        invocation, and the identifiers a single action needs always fit the API's limit.
+        `DeadlineClient` earns its place here alone: the batch size comes from the botocore
+        model through a private attribute only that wrapper exposes. Its UpdateWorkerSchedule
+        reshaping is not wanted, so no other call goes through it.
         """
-        client = self._client(use_worker_credentials=True)
-        limit = _max_identifiers(client)
-        if not 1 <= len(identifiers) <= limit:
-            raise WorkerProtocolError(
-                f"BatchGetJobEntity accepts 1 to {limit} identifiers, got {len(identifiers)}"
+        client = self._worker_client()
+        if not hasattr(client, "batch_get_job_entity"):
+            # Rather than let DeadlineClient fabricate the hard-coded response it returns
+            # for an API that is missing from the model.
+            raise DeadlineRequestUnrecoverableError(
+                ValueError("The installed botocore has no BatchGetJobEntity operation.")
             )
-
-        entities, errors = self._batch_get_job_entity(client, identifiers)
-        for kind, error in errors.items():
-            if error["code"] != "MaxPayloadSizeExceeded":
-                raise WorkerProtocolError(
-                    f"Could not get {kind}: {error['code']}: {error['message']}"
-                )
-            # A step whose template carries large embedded files does not fit in a response
-            # alongside anything else, so ask for that one entity on its own.
-            alone, alone_errors = self._batch_get_job_entity(
-                client, [i for i in identifiers if kind in i]
-            )
-            if alone_errors:
-                raise WorkerProtocolError(
-                    f"Could not get {kind} even on its own: "
-                    f"{alone_errors[kind]['code']}: {alone_errors[kind]['message']}"
-                )
-            entities.update(alone)
-
-        missing = {kind for identifier in identifiers for kind in identifier} - set(entities)
-        if missing:
-            raise WorkerProtocolError(
-                f"{', '.join(sorted(missing))} was neither returned nor reported as an error"
-            )
-        return entities
-
-    def _batch_get_job_entity(
-        self, client: Any, identifiers: list[dict[str, Any]]
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        response = client.batch_get_job_entity(
-            farmId=self.farm_id,
-            fleetId=self.fleet_id,
-            workerId=self.worker_id,
-            identifiers=identifiers,
+        return JobEntities(
+            farm_id=self.farm_id,
+            fleet_id=self.fleet_id,
+            worker_id=self.worker_id,
+            job_id=job_id,
+            deadline_client=DeadlineClient(client),
+            windows_credentials_resolver=None,
+            job_run_as_user_override=None,
         )
-        entities = {
-            kind: entity
-            for wrapper in response.get("entities", [])
-            for kind, entity in wrapper.items()
-        }
-        errors = {
-            kind: error
-            for wrapper in response.get("errors", [])
-            for kind, error in wrapper.items()
-        }
-        return entities, errors
 
     def delete_worker(self) -> None:
         """Deregister the worker. Safe to call when the worker is already gone."""
-        client = self._client(use_worker_credentials=True)
         try:
-            client.delete_worker(
-                farmId=self.farm_id, fleetId=self.fleet_id, workerId=self.worker_id
+            request(
+                protocol.delete_worker,
+                deadline_client=self._worker_client(),
+                config=_FleetLocation(self.farm_id, self.fleet_id),
+                worker_id=self.worker_id,
             )
             logger.info("Deleted worker %s", self.worker_id)
-        except client.exceptions.ResourceNotFoundException:
+        except DeadlineRequestRecoverableError as exc:
+            # The service still has the worker in a running status. Retrying would only
+            # delay a deregistration the registry has already recorded.
+            logger.warning("Worker %s could not be deleted yet: %s", self.worker_id, exc)
+        except DeadlineRequestUnrecoverableError as exc:
+            # DeleteWorker maps a missing worker to the generic unrecoverable error rather
+            # than to DeadlineRequestWorkerNotFound, so the code has to be read back out.
+            if error_code(exc) != "ResourceNotFoundException":
+                raise
             logger.info("Worker %s was already deleted", self.worker_id)
 
 
-def _max_identifiers(client: Any) -> int:
-    """Read BatchGetJobEntity's identifier limit from the model rather than assuming it."""
-    shape = client.meta.service_model.operation_model("BatchGetJobEntity").input_shape
-    return int(shape.members["identifiers"].metadata["max"])
+def error_code(exc: DeadlineRequestError) -> Optional[str]:
+    """The service error code the agent wrapped, when there is one."""
+    response = getattr(exc.inner_exc, "response", None) or {}
+    return response.get("Error", {}).get("Code")
 
 
-# Deadline Cloud tags each parameter with its type. `chunkInt` exists only on task
-# parameters, so a job parameter carrying one is a wire-format error rather than a value.
-JOB_PARAMETER_TYPES = {"string": "STRING", "int": "INT", "float": "FLOAT", "path": "PATH"}
-TASK_PARAMETER_TYPES = {**JOB_PARAMETER_TYPES, "chunkInt": "CHUNK[INT]"}
+# -- job entities ----------------------------------------------------------------
 
 
-def unwrap_parameters(
-    tagged_values: dict[str, dict[str, str]], *, task: bool
-) -> dict[str, dict[str, str]]:
-    """Restate tagged parameters in Open Job Description's own spelling of the types.
-
-    Plain JSON, so the result can cross a checkpoint boundary on its way to a session.
-    """
-    types = TASK_PARAMETER_TYPES if task else JOB_PARAMETER_TYPES
-    parameters = {}
-    for name, tagged_value in (tagged_values or {}).items():
-        for tag, value_type in types.items():
-            if tag in tagged_value:
-                parameters[name] = {"type": value_type, "value": str(tagged_value[tag])}
-                break
-        else:
-            raise WorkerProtocolError(
-                f"Parameter {name} has no value this worker recognizes: "
-                f"{sorted(tagged_value)}"
+def action_identifiers(
+    *, job_id: str, step_id: Optional[str] = None, environment_id: Optional[str] = None
+) -> list[Any]:
+    """Everything one session action needs, so a single warmed call fetches all of it."""
+    identifiers: list[Any] = [
+        JobDetailsIdentifier(jobDetails=JobDetailsIdentifierFields(jobId=job_id))
+    ]
+    if step_id is not None:
+        identifiers.append(
+            StepDetailsIdentifier(
+                stepDetails=StepDetailsIdentifierFields(jobId=job_id, stepId=step_id)
             )
-    return parameters
+        )
+    if environment_id is not None:
+        identifiers.append(
+            EnvironmentDetailsIdentifier(
+                environmentDetails=EnvironmentDetailsIdentifierFields(
+                    jobId=job_id, environmentId=environment_id
+                )
+            )
+        )
+    return identifiers
+
+
+def environment_template(
+    entities: JobEntities, *, job_id: str, environment_id: str, exiting: bool
+) -> Any:
+    """Fetch and parse one environment, neutering its `onEnter` when only the exit is wanted.
+
+    Parsed here rather than through `JobEntities.environment_details` so that both the
+    `onEnter` replacement and the nested authored shape are handled before validation.
+    """
+    data = copy.deepcopy(
+        entities.request(
+            identifier=EnvironmentDetailsIdentifier(
+                environmentDetails=EnvironmentDetailsIdentifierFields(
+                    jobId=job_id, environmentId=environment_id
+                )
+            )
+        )
+    )
+    # BatchGetJobEntity returns the definition unwrapped from the `environment` key an
+    # authored template nests it under. Both shapes are accepted because the nested form is
+    # what a reader sees in `queue_environments/`.
+    data["template"] = data["template"].get("environment") or data["template"]
+    if exiting:
+        data["template"] = _with_noop_on_enter(data["template"])
+    details = EnvironmentDetails.from_boto(EnvironmentDetails.validate_entity_data(data))
+    return details.environment
+
+
+# Stands in for an `onEnter` that already ran in an earlier invocation. /bin/sh rather than
+# /bin/true because openjd-sessions already execs a #!/bin/sh wrapper, so this adds no new
+# assumption about what the runtime image contains.
+NOOP_ACTION = {"command": "/bin/sh", "args": ["-c", "exit 0"]}
+
+
+def _with_noop_on_enter(definition: dict[str, Any]) -> dict[str, Any]:
+    """Return the environment with its `onEnter` replaced by a command that does nothing.
+
+    Replaced rather than removed because `onEnter` is required in newer revisions of the
+    model. The real `onEnter` already ran in an earlier invocation, and its variables come
+    back through `os_env_vars`, so running it again would only repeat its side effects.
+    """
+    script = definition.get("script")
+    if not script or not script.get("actions"):
+        return definition
+    actions = {**script["actions"], "onEnter": dict(NOOP_ACTION)}
+    return {**definition, "script": {**script, "actions": actions}}
+
+
+def unwrap_parameters(tagged_values: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Restate tagged parameters in Open Job Description's own spelling of the types."""
+    return parameters_from_api_response(tagged_values or {})
 
 
 def _as_iso(expiration: Any) -> str:
@@ -333,7 +478,7 @@ def _as_iso(expiration: Any) -> str:
     return expiration if isinstance(expiration, str) else expiration.isoformat()
 
 
-def default_capabilities() -> dict[str, Any]:
+def default_capabilities() -> Capabilities:
     """Capabilities describing a Lambda-hosted worker.
 
     Read from the runtime's own settings so a host requirement is judged against what the
@@ -341,17 +486,17 @@ def default_capabilities() -> dict[str, Any]:
     attribute that job templates target.
     """
     memory_mib = int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1769"))
-    return {
-        "amounts": [
+    return Capabilities(
+        amounts={
             # Lambda gives a function one vCPU per 1769 MB, and nothing exposes the number.
-            {"name": "amount.worker.vcpu", "value": max(1, memory_mib // 1769)},
-            {"name": "amount.worker.memory", "value": memory_mib},
-            {"name": "amount.worker.disk.scratch", "value": SCRATCH_MIB},
-            {"name": "amount.worker.gpu", "value": 0},
-        ],
-        "attributes": [
-            {"name": "attr.worker.os.family", "values": ["linux"]},
-            {"name": "attr.worker.cpu.arch", "values": ["x86_64"]},
-            {"name": "attr.durable.lambda", "values": ["true"]},
-        ],
-    }
+            "amount.worker.vcpu": max(1, memory_mib // 1769),
+            "amount.worker.memory": memory_mib,
+            "amount.worker.disk.scratch": SCRATCH_MIB,
+            "amount.worker.gpu": 0,
+        },
+        attributes={
+            "attr.worker.os.family": ["linux"],
+            "attr.worker.cpu.arch": ["x86_64"],
+            "attr.durable.lambda": ["true"],
+        },
+    )

@@ -28,11 +28,14 @@ from aws_durable_execution_sdk_python.config import (  # type: ignore[import-not
 import action_output
 import providers
 import session_env
+import worker_protocol
 import worker_registry
 from worker_protocol import (
+    WORKER_UNUSABLE,
+    DeadlineRequestError,
+    DeadlineRequestInterrupted,
     DeadlineWorker,
-    WorkerNotUsableError,
-    WorkerProtocolError,
+    WorkerStatus,
     default_capabilities,
     unwrap_parameters,
 )
@@ -53,6 +56,9 @@ MAX_TASK_POLLS = int(os.environ.get("MAX_TASK_POLLS", "120"))
 # Raise it for bursty jobs; at the usual 15s interval 20 polls is about five minutes.
 MAX_IDLE_POLLS = int(os.environ.get("MAX_IDLE_POLLS", "20"))
 MAX_LOOP_ITERATIONS = int(os.environ.get("MAX_LOOP_ITERATIONS", "2000"))
+
+# Used only when a poll never reached the service and so brought back no interval of its own.
+DEFAULT_UPDATE_INTERVAL_SECONDS = 15
 
 # The service's limit on a progressMessage; a longer one fails the whole request.
 MAX_PROGRESS_MESSAGE = 4096
@@ -86,7 +92,9 @@ def register_worker(step_context, host_name: str) -> dict[str, Any]:
     """
     worker = DeadlineWorker(farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION)
     worker_id = worker.create_worker(host_name=host_name)
-    worker.update_worker_status(status="STARTED", capabilities=default_capabilities())
+    worker.update_worker_status(
+        status=WorkerStatus.STARTED, capabilities=default_capabilities()
+    )
     worker_registry.register(
         fleet_id=FLEET_ID, worker_id=worker_id, started_at=worker_registry.utc_now_iso()
     )
@@ -117,9 +125,14 @@ def heartbeat(step_context, worker_id: str, progress: dict[str, Any]) -> dict[st
     )
     try:
         response = worker.update_worker_schedule(updated_session_actions=progress)
-    except WorkerNotUsableError:
+    except WORKER_UNUSABLE:
         step_context.logger.warning(f"Worker {worker_id} is no longer usable while working")
         return {"workerDeleted": True, "cancelSessionActions": {}}
+    except DeadlineRequestInterrupted as exc:
+        # Nothing was reported and nothing was learned. The next poll of the running request
+        # heartbeats again, so one missed beat is not worth ending the action over.
+        step_context.logger.warning(f"Heartbeat for {worker_id} gave up retrying: {exc}")
+        return {"workerDeleted": False, "retryLater": True, "cancelSessionActions": {}}
     return {
         "workerDeleted": False,
         "desiredWorkerStatus": response.get("desiredWorkerStatus"),
@@ -139,9 +152,19 @@ def poll_schedule(
         response = worker.update_worker_schedule(
             updated_session_actions=updated_session_actions
         )
-    except WorkerNotUsableError:
+    except WORKER_UNUSABLE:
         step_context.logger.warning(f"Worker {worker_id} is no longer usable")
         return {"workerDeleted": True, "updateIntervalSeconds": 0, "assignedSessions": {}}
+    except DeadlineRequestInterrupted as exc:
+        # The request never landed, so any results it carried were not recorded and the
+        # service will assign the same work again.
+        step_context.logger.warning(f"Poll for {worker_id} gave up retrying: {exc}")
+        return {
+            "workerDeleted": False,
+            "retryLater": True,
+            "updateIntervalSeconds": DEFAULT_UPDATE_INTERVAL_SECONDS,
+            "assignedSessions": {},
+        }
 
     # Scale-in for a customer-managed fleet is the fleet owner's business, so this flag,
     # not `desiredWorkerStatus`, is what normally ends a worker's life here.
@@ -150,7 +173,9 @@ def poll_schedule(
     return {
         "workerDeleted": False,
         "drainRequested": drain_requested,
-        "updateIntervalSeconds": response.get("updateIntervalSeconds", 15),
+        "updateIntervalSeconds": response.get(
+            "updateIntervalSeconds", DEFAULT_UPDATE_INTERVAL_SECONDS
+        ),
         "desiredWorkerStatus": response.get("desiredWorkerStatus"),
         "assignedSessions": _summarize_sessions(response.get("assignedSessions", {})),
         "cancelSessionActions": response.get("cancelSessionActions", {}),
@@ -186,41 +211,54 @@ def run_action(
         environment_id = (
             None if kind == "taskRun" else definition[kind].get("environmentId")
         )
-        entities = worker.get_job_entities(
-            identifiers=[
-                {"jobDetails": {"jobId": job_id}},
-                {"stepDetails": {"jobId": job_id, "stepId": definition["taskRun"]["stepId"]}}
-                if kind == "taskRun"
-                else {
-                    "environmentDetails": {"jobId": job_id, "environmentId": environment_id}
-                },
-            ]
+        step_id = definition["taskRun"]["stepId"] if kind == "taskRun" else None
+        entities = worker.job_entities(job_id=job_id)
+        # Warmed in one call because each round trip happens inside a billed invocation. An
+        # entity too large to share a response is left uncached and fetched alone below.
+        entities.cache_entities(
+            worker_protocol.action_identifiers(
+                job_id=job_id, step_id=step_id, environment_id=environment_id
+            )
         )
-        job_details = entities["jobDetails"]
-        template_key = "stepDetails" if kind == "taskRun" else "environmentDetails"
+        job_details = entities.job_details()
+        template = (
+            entities.step_details(step_id=step_id).step_template
+            if kind == "taskRun"
+            else worker_protocol.environment_template(
+                entities,
+                job_id=job_id,
+                environment_id=environment_id,
+                exiting=kind == "envExit",
+            )
+        )
         # A queue with no role leaves the base environment without credentials, which is
         # what keeps a task's script off the worker's own identity.
         credentials = (
-            worker.assume_queue_role(queue_id=queue_id)
-            if job_details.get("queueRoleArn")
-            else None
+            worker.assume_queue_role(queue_id=queue_id) if job_details.queue_role_arn else None
         )
         result = session_runner.run_action(
             kind=kind,
             session_id=session_id,
-            template=entities[template_key]["template"],
-            job_parameters=unwrap_parameters(job_details.get("parameters"), task=False),
-            task_parameters=unwrap_parameters(
-                definition.get("taskRun", {}).get("parameters"), task=True
-            ),
-            path_mapping_rules=job_details.get("pathMappingRules"),
+            template=template,
+            job_parameters=job_details.parameters,
+            task_parameters=unwrap_parameters(definition.get("taskRun", {}).get("parameters")),
+            path_mapping_rules=job_details.path_mapping_rules,
             os_env_vars=session_env.compose(
                 session_env.base_env(region=REGION, credentials=credentials), env_layers
             ),
             environment_id=environment_id,
         )
+    except DeadlineRequestInterrupted as exc:
+        # Nothing ran, so this action is still the service's to assign. Reporting a failure
+        # would spend the task's retry on a throttle.
+        step_context.logger.warning(f"Action {action['sessionActionId']} not started: {exc}")
+        return {"state": "RETRY_LATER", "message": str(exc)}
     except (
-        WorkerProtocolError,
+        DeadlineRequestError,
+        # How the agent's entity layer reports a broken job: RuntimeError for an entity the
+        # service refused, ValueError for one that failed its validation.
+        RuntimeError,
+        ValueError,
         session_runner.SessionRunnerError,
         action_output.MalformedOutputError,
     ) as exc:
@@ -258,11 +296,13 @@ def deregister_worker(step_context, worker_id: str) -> dict[str, Any]:
         farm_id=FARM_ID, fleet_id=FLEET_ID, region=REGION, worker_id=worker_id
     )
     try:
-        worker.update_worker_status(status="STOPPING")
-        worker.update_worker_status(status="STOPPED")
+        worker.update_worker_status(status=WorkerStatus.STOPPING)
+        worker.update_worker_status(status=WorkerStatus.STOPPED)
         worker.delete_worker()
         step_context.logger.info(f"Worker {worker_id} deregistered")
-    except WorkerNotUsableError:
+    except (*worker_protocol.WORKER_UNDRAINABLE, DeadlineRequestInterrupted):
+        # A worker the service has already taken away needs no draining, and the registry row
+        # is removed below either way.
         pass
     # Last, so this worker keeps counting toward fleet capacity until it has stopped.
     worker_registry.deregister(fleet_id=FLEET_ID, worker_id=worker_id)
@@ -297,6 +337,16 @@ def lambda_handler(event: dict[str, Any], context: DurableContext) -> dict[str, 
                 "stopReason": "worker-deleted-by-service",
                 "tasksCompleted": tasks_completed,
             }
+
+        if poll.get("retryLater"):
+            # The request budget ran out before the service answered. Counted as idle so a
+            # worker that can never reach the service still gives up eventually.
+            idle_polls += 1
+            if idle_polls >= MAX_IDLE_POLLS:
+                stop_reason = "idle-timeout"
+                break
+            context.wait(Duration.from_seconds(poll["updateIntervalSeconds"]))
+            continue
 
         if poll.get("desiredWorkerStatus") == "STOPPED":
             stop_reason = "service-requested-stop"
@@ -369,6 +419,11 @@ def _finish_assigned_work(
                     action=action,
                     env_layers=layers,
                 )
+                if result is None:
+                    # Never attempted and never reported, so the service will assign it
+                    # again. Later actions have to wait: reporting one of those now would
+                    # arrive out of order.
+                    break
                 if result.get("completedStatus") == "SUCCEEDED":
                     succeeded += 1
                 else:
@@ -376,7 +431,9 @@ def _finish_assigned_work(
 
             # One result per call, in assigned order. The service rejects an out-of-order
             # report with "comes in a wrong order" and drops every result in the request.
-            context.step(poll_schedule(worker_id, {action_id: result}))
+            if context.step(poll_schedule(worker_id, {action_id: result})).get("retryLater"):
+                # This result never landed, so the next one would be out of order too.
+                break
         if not layers:
             del env_layers[session_id]
     return succeeded
@@ -391,8 +448,11 @@ def _run_session_action(
     job_id: str,
     action: dict[str, Any],
     env_layers: list[list[Any]],
-) -> dict[str, Any]:
-    """Run one assigned session action and return its result for the next heartbeat."""
+) -> Optional[dict[str, Any]]:
+    """Run one assigned session action and return its result for the next heartbeat.
+
+    Returns None when the action was never attempted and should be assigned again.
+    """
     definition = action["definition"]
     action_id = action["sessionActionId"]
     started_at = context.step(mark_action_started(action_id))
@@ -412,6 +472,9 @@ def _run_session_action(
     outcome = context.step(
         run_action(worker_id, session_id, queue_id, job_id, action, list(env_layers))
     )
+
+    if outcome["state"] == "RETRY_LATER":
+        return None
 
     if kind == "envEnter" and outcome["state"] == "SUCCESS":
         env_layers.append([definition["envEnter"]["environmentId"], outcome["envDelta"]])
@@ -491,7 +554,7 @@ def _await_request(
                 },
             )
         )
-        if beat["workerDeleted"]:
+        if beat.get("workerDeleted"):
             return _action_result(
                 "INTERRUPTED",
                 started_at,

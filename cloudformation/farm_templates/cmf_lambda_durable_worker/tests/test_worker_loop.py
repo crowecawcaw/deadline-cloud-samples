@@ -35,6 +35,7 @@ from harness import (
     session_outcome,
     session_with,
     stub_session_runner,
+    stub_worker,
     task_run_action,
 )
 
@@ -79,7 +80,7 @@ class _WorkerLoopTestCase(unittest.TestCase):
         ), mock.patch.object(
             durable_worker, "heartbeat", lambda worker_id, progress: QUIET_HEARTBEAT
         ), mock.patch.object(
-            durable_worker, "DeadlineWorker", mock.MagicMock()
+            durable_worker, "DeadlineWorker", return_value=stub_worker()
         ), mock.patch.object(
             durable_worker, "MAX_IDLE_POLLS", max_idle_polls
         ):
@@ -132,6 +133,60 @@ class TestDrainRequested(_WorkerLoopTestCase):
         self.assertEqual(
             poll_calls[1]["updates"]["sessionaction-1"]["completedStatus"], "SUCCEEDED"
         )
+
+
+class TestRequestGaveUpRetrying(_WorkerLoopTestCase):
+    """A request that spent its whole retry budget without landing.
+
+    The distinction that matters: nothing was reported and nothing was learned, so waiting
+    unbilled and asking again is the remedy, not failing the work.
+    """
+
+    def test_a_poll_that_gave_up_waits_and_asks_again(self):
+        result, poll_calls, deregister, context = self._run_loop(
+            [
+                poll_response(retryLater=True, updateIntervalSeconds=30),
+                poll_response(assignedSessions=_task_run_session()),
+            ]
+        )
+        self.assertEqual(context.waits[0], 30)
+        self.assertEqual(result["tasksCompleted"], 1)
+        deregister.assert_called_once_with(WORKER_ID)
+
+    def test_a_worker_that_can_never_reach_the_service_still_gives_up(self):
+        # Otherwise it would spin to MAX_LOOP_ITERATIONS holding fleet capacity.
+        result, _, _, _ = self._run_loop(
+            [poll_response(retryLater=True) for _ in range(5)], max_idle_polls=3
+        )
+        self.assertEqual(result["stopReason"], "idle-timeout")
+
+    def test_a_result_that_never_landed_holds_back_the_next_one(self):
+        # The service rejects an out-of-order report and drops every result in the request,
+        # so the second action's result has to wait for the first to be accepted.
+        session = session_with(
+            [task_run_action("sessionaction-1"), task_run_action("sessionaction-2")]
+        )
+        _, poll_calls, _, _ = self._run_loop(
+            [
+                poll_response(assignedSessions=session),
+                poll_response(retryLater=True),
+                poll_response(desiredWorkerStatus="STOPPED"),
+            ]
+        )
+        reported = [call["updates"] for call in poll_calls if call["updates"]]
+        self.assertEqual([sorted(update) for update in reported], [["sessionaction-1"]])
+
+    def test_an_action_that_never_started_is_not_reported_at_all(self):
+        with mock.patch.object(
+            durable_worker,
+            "run_action",
+            lambda *args: {"state": "RETRY_LATER", "message": "gave up"},
+        ):
+            _, poll_calls, _, _ = self._run_loop(
+                [poll_response(assignedSessions=_task_run_session())]
+            )
+        # Leaving it unreported is what lets the service assign it again.
+        self.assertEqual([call["updates"] for call in poll_calls if call["updates"]], [])
 
 
 class TestIdleBehavior(_WorkerLoopTestCase):
@@ -236,7 +291,7 @@ class _ActionTestCase(unittest.TestCase):
 
         context = FakeDurableContext()
         with stub_session_runner(outcomes=outcomes) as runner, mock.patch.object(
-            durable_worker, "DeadlineWorker", mock.MagicMock()
+            durable_worker, "DeadlineWorker", return_value=stub_worker()
         ), mock.patch.object(
             durable_worker, "heartbeat", fake_heartbeat
         ), mock.patch.object(
@@ -510,7 +565,7 @@ class TestHeartbeatWhileAwaiting(_ActionTestCase):
         with stub_session_runner(
             outcomes=[session_outcome(tokens=[await_token("seedance")])]
         ), mock.patch.object(
-            durable_worker, "DeadlineWorker", mock.MagicMock()
+            durable_worker, "DeadlineWorker", return_value=stub_worker()
         ), mock.patch.object(
             durable_worker, "heartbeat", lambda worker_id, progress: QUIET_HEARTBEAT
         ):

@@ -5,6 +5,9 @@ This is the same library `deadline-cloud-worker-agent` runs sessions with. Passi
 `user=None` short-circuits every privileged path in it, so it needs no sudo, no root, no
 group setup, and no user of its own, which is what makes it usable inside Lambda.
 
+Templates and parameters arrive already parsed and validated, by the same agent code that
+parses them for a real worker. This module only runs them.
+
 Nothing here may span a `context.wait()`. The wait ends the invocation, which kills the
 subprocess and discards the working directory, so the caller runs exactly one action per
 invocation and this module blocks until that action has finished and been reaped.
@@ -20,17 +23,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from openjd.model import (  # type: ignore[import-not-found]
-    DecodeValidationError,
     ParameterValue,
     ParameterValueType,
     SymbolTable,
-    parse_model,
-)
-from openjd.model.v2023_09 import (  # type: ignore[import-not-found]
-    Environment as Environment_2023_09,
-)
-from openjd.model.v2023_09 import (  # type: ignore[import-not-found]
-    StepTemplate as StepTemplate_2023_09,
 )
 from openjd.sessions import (  # type: ignore[import-not-found]
     LOG,
@@ -52,11 +47,6 @@ SESSION_ROOT = Path(os.environ.get("SESSION_ROOT", "/tmp/openjd"))
 ACTION_TIMEOUT_SECONDS = int(os.environ.get("ACTION_TIMEOUT_SECONDS", "240"))
 CANCEL_GRACE_SECONDS = int(os.environ.get("CANCEL_GRACE_SECONDS", "20"))
 
-# Stands in for an `onEnter` that already ran in an earlier invocation. /bin/sh rather than
-# /bin/true because openjd-sessions already execs a #!/bin/sh wrapper, so this adds no new
-# assumption about what the runtime image contains.
-NOOP_ACTION = {"command": "/bin/sh", "args": ["-c", "exit 0"]}
-
 ACTION_STATES = {
     ActionState.SUCCESS: "SUCCESS",
     ActionState.FAILED: "FAILED",
@@ -73,14 +63,18 @@ def run_action(
     *,
     kind: str,
     session_id: str,
-    template: dict[str, Any],
-    job_parameters: dict[str, dict[str, str]],
+    template: Any,
+    job_parameters: dict[str, ParameterValue],
     os_env_vars: dict[str, Optional[str]],
-    task_parameters: Optional[dict[str, dict[str, str]]] = None,
-    path_mapping_rules: Optional[list[dict[str, str]]] = None,
+    task_parameters: Optional[dict[str, ParameterValue]] = None,
+    path_mapping_rules: Optional[list[PathMappingRule]] = None,
     environment_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Run one `taskRun`, `envEnter`, or `envExit` action and report what it did."""
+    """Run one `taskRun`, `envEnter`, or `envExit` action and report what it did.
+
+    `template` is an already-parsed step template or environment.
+    """
+    _reject_chunked_job_parameters(job_parameters)
     _sweep_stale_sessions()
     SESSION_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -91,8 +85,8 @@ def run_action(
     try:
         session = Session(
             session_id=session_id,
-            job_parameter_values=_parameter_values(job_parameters, task=False),
-            path_mapping_rules=_path_mapping_rules(path_mapping_rules),
+            job_parameter_values=job_parameters,
+            path_mapping_rules=path_mapping_rules or None,
             user=None,
             callback=waiter.on_status,
             os_env_vars=os_env_vars,  # type: ignore[arg-type]  # a None value means "remove"
@@ -101,19 +95,19 @@ def run_action(
         try:
             if kind == "taskRun":
                 static_variables: dict[str, str] = {}
-                step = _parse(StepTemplate_2023_09, template, "step")
                 waiter.arm()
                 session.run_task(
-                    step_script=step.script,
-                    task_parameter_values=_parameter_values(task_parameters or {}, task=True),
+                    step_script=template.script,
+                    task_parameter_values=task_parameters or {},
                 )
             else:
-                environment, static_variables = _prepare_environment(
-                    kind=kind, template=template, job_parameters=job_parameters
+                # An exit un-applies the layer, so nothing that exit resolves is worth keeping.
+                static_variables = (
+                    {} if kind == "envExit" else _resolve_variables(template, job_parameters)
                 )
                 waiter.arm()
                 session.enter_environment(
-                    environment=environment, identifier=environment_id or session_id
+                    environment=template, identifier=environment_id or session_id
                 )
             status = waiter.settle(session)
 
@@ -203,68 +197,15 @@ class _ProtocolCapture(logging.Handler):
             self.lines.append(message)
 
 
-def _prepare_environment(
-    *, kind: str, template: dict[str, Any], job_parameters: dict[str, dict[str, str]]
-) -> tuple[Any, dict[str, str]]:
-    """Parse an environment template and resolve the variables it defines statically."""
-    # BatchGetJobEntity returns the definition unwrapped from the `environment` key an
-    # authored template nests it under. Both shapes are accepted because the nested form is
-    # what a reader sees in `queue_environments/`.
-    definition = template.get("environment") or template
-    if kind == "envExit":
-        definition = _with_noop_on_enter(definition)
-    environment = _parse(Environment_2023_09, definition, "environment")
-    if kind == "envExit":
-        # The layer is being un-applied, so nothing this exit prints is worth keeping.
-        return environment, {}
-    return environment, _resolve_variables(environment, job_parameters)
-
-
-def _parse(model: Any, obj: dict[str, Any], label: str) -> Any:
-    try:
-        return parse_model(model=model, obj=obj)
-    except DecodeValidationError as exc:
-        raise SessionRunnerError(f"This job's {label} template is not valid: {exc}") from exc
-
-
-def _parameter_values(
-    parameters: dict[str, dict[str, str]], *, task: bool
-) -> dict[str, ParameterValue]:
-    """Convert already-unwrapped parameters into what a session expects."""
-    values = {}
-    for name, parameter in parameters.items():
-        try:
-            value_type = ParameterValueType(parameter["type"])
-        except ValueError as exc:
-            raise SessionRunnerError(
-                f"Parameter {name} has an unusable type {parameter['type']!r}"
-            ) from exc
-        if value_type is ParameterValueType.CHUNK_INT and not task:
+def _reject_chunked_job_parameters(job_parameters: dict[str, ParameterValue]) -> None:
+    """A chunked integer is a task parameter only, so one here is a wire-format error."""
+    for name, value in job_parameters.items():
+        if value.type is ParameterValueType.CHUNK_INT:
             raise SessionRunnerError(f"Job parameter {name} cannot be a chunked integer")
-        values[name] = ParameterValue(type=value_type, value=parameter["value"])
-    return values
-
-
-def _path_mapping_rules(
-    rules: Optional[list[dict[str, str]]],
-) -> Optional[list[PathMappingRule]]:
-    """Translate the API's rules into the library's, which spells its fields differently."""
-    if not rules:
-        return None
-    return [
-        PathMappingRule.from_dict(
-            {
-                "source_path_format": rule["sourcePathFormat"],
-                "source_path": rule["sourcePath"],
-                "destination_path": rule["destinationPath"],
-            }
-        )
-        for rule in rules
-    ]
 
 
 def _resolve_variables(
-    environment: Any, job_parameters: dict[str, dict[str, str]]
+    environment: Any, job_parameters: dict[str, ParameterValue]
 ) -> dict[str, str]:
     """Resolve an environment's static `variables`, which the library does not report.
 
@@ -275,8 +216,8 @@ def _resolve_variables(
         return {}
     symbols: dict[str, str] = {}
     for name, parameter in job_parameters.items():
-        symbols[f"Param.{name}"] = parameter["value"]
-        symbols[f"RawParam.{name}"] = parameter["value"]
+        symbols[f"Param.{name}"] = parameter.value
+        symbols[f"RawParam.{name}"] = parameter.value
     symbol_table = SymbolTable(source=symbols)
     try:
         return {
@@ -288,20 +229,6 @@ def _resolve_variables(
             f"A variable of environment '{environment.name}' could not be resolved from job "
             f"parameters alone: {exc}"
         ) from exc
-
-
-def _with_noop_on_enter(definition: dict[str, Any]) -> dict[str, Any]:
-    """Return the environment with its `onEnter` replaced by a command that does nothing.
-
-    Replaced rather than removed because `onEnter` is required in newer revisions of the
-    model. The real `onEnter` already ran in an earlier invocation, and its variables come
-    back through `os_env_vars`, so running it again would only repeat its side effects.
-    """
-    script = definition.get("script")
-    if not script or not script.get("actions"):
-        return definition
-    actions = {**script["actions"], "onEnter": dict(NOOP_ACTION)}
-    return {**definition, "script": {**script, "actions": actions}}
 
 
 def _sweep_stale_sessions() -> None:

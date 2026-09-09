@@ -60,14 +60,16 @@ cp -R "$SCRIPT_DIR"/lambda/providers "$BUILD_DIR/"
 # lands flat next to the handler modules, which is where the runtime looks first.
 #
 # The durable execution SDK is bundled rather than taken from the runtime so that a runtime
-# update cannot change the behavior of in-flight executions. openjd-sessions is what runs
-# the session actions, and openjd-model with pydantic are what it parses templates with;
-# none of the three is in the runtime.
+# update cannot change the behavior of in-flight executions. deadline-cloud-worker-agent is
+# what the Deadline Cloud protocol comes from, and it pins openjd-sessions and openjd-model
+# to the versions a real worker is tested against; they are named anyway so a reader can see
+# what runs the session actions. None of them is in the runtime.
 python3 -m pip install \
   --quiet --target "$BUILD_DIR" \
   --only-binary :all: --platform manylinux2014_x86_64 \
   --python-version 3.14 --implementation cp \
   'aws-durable-execution-sdk-python<2' \
+  'deadline-cloud-worker-agent<1' \
   'openjd-sessions<1' \
   'openjd-model<1' \
   'pydantic<3'

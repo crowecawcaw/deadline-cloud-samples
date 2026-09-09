@@ -8,6 +8,10 @@ its result. Checkpoint replay belongs to Lambda and is not modeled.
 
 `session_runner` is stubbed per test rather than globally, because `durable_worker` imports it
 by name on every call. That keeps the real module importable for the integration tests.
+
+The Deadline Cloud protocol layer is not stubbed. `JobEntities` below is the worker agent's
+own, driven by scripted BatchGetJobEntity responses, so its batching, its caching, and its
+validation are all exercised rather than mocked away.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import unittest.mock as mock
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import boto3
 from botocore.exceptions import ClientError
 
 LAMBDA_DIR = Path(__file__).resolve().parents[1] / "lambda"
@@ -198,3 +203,145 @@ def env_exit_action(
 def session_with(actions: list[dict], session_id: str = "session-1") -> dict:
     """One assigned session holding the given already-summarized actions."""
     return {session_id: {"queueId": QUEUE_ID, "jobId": JOB_ID, "sessionActions": actions}}
+
+
+# -- job entities ----------------------------------------------------------------
+
+# The members BatchGetJobEntity marks required. Spelled out because the worker agent validates
+# every entity strictly, which is what makes these fixtures evidence about the real wire shape.
+
+
+def job_details(**extra) -> dict:
+    return {
+        "jobDetails": {
+            "jobId": JOB_ID,
+            "logGroupName": "/aws/deadline/farm-x/queue-y",
+            "schemaVersion": "jobtemplate-2023-09",
+            **extra,
+        }
+    }
+
+
+def step_details(template: Optional[dict] = None, *, step_id: str = "step-1", **extra) -> dict:
+    return {
+        "stepDetails": {
+            "jobId": JOB_ID,
+            "stepId": step_id,
+            "schemaVersion": "jobtemplate-2023-09",
+            "template": template if template is not None else minimal_step_template(),
+            "dependencies": [],
+            **extra,
+        }
+    }
+
+
+def environment_details(template: Optional[dict] = None, *, environment_id: str = "env-1") -> dict:
+    return {
+        "environmentDetails": {
+            "jobId": JOB_ID,
+            "environmentId": environment_id,
+            "schemaVersion": "jobtemplate-2023-09",
+            "template": template if template is not None else minimal_environment_template(),
+        }
+    }
+
+
+def minimal_step_template() -> dict:
+    return {"name": "Generate", "script": {"actions": {"onRun": {"command": "/bin/true"}}}}
+
+
+def minimal_environment_template() -> dict:
+    # An environment needs at least one of `script` or `variables` to be valid.
+    return {"name": "Config", "variables": {"CONFIGURED": "yes"}}
+
+
+def entity_error(kind: str, code: str, message: str, **fields) -> dict:
+    return {kind: {"jobId": JOB_ID, "code": code, "message": message, **fields}}
+
+
+@functools.lru_cache(maxsize=1)
+def deadline_client():
+    """A real, unstubbed client, used only for the service model it carries."""
+    return boto3.client(
+        "deadline", region_name="us-west-2", aws_access_key_id="a", aws_secret_access_key="b"
+    )
+
+
+class ScriptedEntityClient:
+    """A `DeadlineClient` that answers BatchGetJobEntity from a list of responses.
+
+    The last response repeats, so a test scripts only the calls it cares about. The service
+    model is the installed botocore's, so `JobEntities` still reads the real identifier limit
+    from it rather than from anything this class invents.
+    """
+
+    def __init__(self, responses: list[dict]) -> None:
+        self._responses = list(responses)
+        self.calls: list[list[dict]] = []
+        self._real_client = deadline_client()
+
+    def batch_get_job_entity(self, *, farmId, fleetId, workerId, identifiers):
+        self.calls.append(list(identifiers))
+        return self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+
+
+class AnyEntityClient(ScriptedEntityClient):
+    """A `DeadlineClient` that answers whatever identifier it is given.
+
+    For tests about the loop rather than about a template: every action's entities resolve,
+    whichever step or environment it names.
+    """
+
+    def __init__(self, *, job_fields: Optional[dict] = None, template: Optional[dict] = None):
+        super().__init__([])
+        self._job_fields = job_fields or {}
+        self._template = template
+
+    def batch_get_job_entity(self, *, farmId, fleetId, workerId, identifiers):
+        self.calls.append(list(identifiers))
+        entities = []
+        for identifier in identifiers:
+            ((kind, fields),) = identifier.items()
+            if kind == "jobDetails":
+                entities.append(job_details(**self._job_fields))
+            elif kind == "stepDetails":
+                entities.append(step_details(self._template, step_id=fields["stepId"]))
+            elif kind == "environmentDetails":
+                entities.append(
+                    environment_details(
+                        self._template or minimal_environment_template(),
+                        environment_id=fields["environmentId"],
+                    )
+                )
+        return {"entities": entities, "errors": []}
+
+
+def job_entities(client, *, job_id: str = JOB_ID):
+    """The worker agent's own JobEntities, over one of the clients above."""
+    from deadline_worker_agent.sessions.job_entities import JobEntities
+
+    return JobEntities(
+        farm_id=FARM_ID,
+        fleet_id=FLEET_ID,
+        worker_id=WORKER_ID,
+        job_id=job_id,
+        deadline_client=client,
+        windows_credentials_resolver=None,
+        job_run_as_user_override=None,
+    )
+
+
+def stub_worker(client=None, *, queue_credentials: Optional[dict] = None):
+    """A `DeadlineWorker` whose entity fetching is real and whose API calls are not."""
+    worker = mock.MagicMock()
+    worker.entity_client = client if client is not None else AnyEntityClient()
+    worker.job_entities.side_effect = lambda *, job_id: job_entities(
+        worker.entity_client, job_id=job_id
+    )
+    worker.assume_queue_role.return_value = queue_credentials or {
+        "accessKeyId": "AKIAQUEUE",
+        "secretAccessKey": "s",
+        "sessionToken": "t",
+        "expiration": "2026-01-01T00:00:00+00:00",
+    }
+    return worker

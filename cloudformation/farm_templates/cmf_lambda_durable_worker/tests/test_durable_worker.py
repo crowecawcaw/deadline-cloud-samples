@@ -13,10 +13,23 @@ import unittest.mock as mock
 from datetime import datetime, timedelta, timezone
 
 import boto3
-from botocore.stub import ANY, Stubber
+from botocore.stub import Stubber
 
 import harness  # noqa: F401  (stubs the durable execution SDK, puts lambda/ on sys.path)
-from harness import JOB_ID, QUEUE_ID, WORKER_ID, session_outcome, stub_session_runner, task_run_action
+from harness import (
+    JOB_ID,
+    QUEUE_ID,
+    WORKER_ID,
+    AnyEntityClient,
+    ScriptedEntityClient,
+    entity_error,
+    job_details,
+    job_entities,
+    step_details,
+    stub_session_runner,
+    stub_worker,
+    task_run_action,
+)
 
 import durable_worker
 import worker_protocol
@@ -32,42 +45,65 @@ class TestParameterUnwrapping(unittest.TestCase):
                 "Frame": {"int": "42"},
                 "Ratio": {"float": "1.5"},
                 "Scene": {"path": "/tmp/x"},
-            },
-            task=True,
-        )
-        self.assertEqual(unwrapped["Prompt"], {"type": "STRING", "value": "a car"})
-        self.assertEqual(unwrapped["Frame"], {"type": "INT", "value": "42"})
-        self.assertEqual(unwrapped["Ratio"], {"type": "FLOAT", "value": "1.5"})
-        self.assertEqual(unwrapped["Scene"], {"type": "PATH", "value": "/tmp/x"})
-
-    def test_chunk_int_is_a_task_parameter_only(self):
-        unwrapped = worker_protocol.unwrap_parameters({"Frames": {"chunkInt": "1-10"}}, task=True)
-        self.assertEqual(unwrapped["Frames"], {"type": "CHUNK[INT]", "value": "1-10"})
-        # It is not a member of the job parameter union at all, so a job parameter carrying one
-        # is a wire-format error rather than a value to pass along.
-        self.assertNotIn("chunkInt", worker_protocol.JOB_PARAMETER_TYPES)
-        with self.assertRaises(worker_protocol.WorkerProtocolError):
-            worker_protocol.unwrap_parameters({"Frames": {"chunkInt": "1-10"}}, task=False)
-
-    def test_job_parameters_unwrap_the_four_types_the_api_defines(self):
-        unwrapped = worker_protocol.unwrap_parameters(
-            {"A": {"string": "s"}, "B": {"int": "1"}, "C": {"float": "2.5"}, "D": {"path": "/p"}},
-            task=False,
+            }
         )
         self.assertEqual(
-            {name: value["type"] for name, value in unwrapped.items()},
+            {name: (value.type.value, value.value) for name, value in unwrapped.items()},
+            {
+                "Prompt": ("STRING", "a car"),
+                "Frame": ("INT", "42"),
+                "Ratio": ("FLOAT", "1.5"),
+                "Scene": ("PATH", "/tmp/x"),
+            },
+        )
+
+    def test_chunk_int_is_a_task_parameter_only(self):
+        unwrapped = worker_protocol.unwrap_parameters({"Frames": {"chunkInt": "1-10"}})
+        self.assertEqual(unwrapped["Frames"].type.value, "CHUNK[INT]")
+        # The agent preserves the service's wire value. session_runner owns the stricter
+        # check that refuses it as a job parameter before starting an OpenJD session.
+        entities = job_entities(
+            ScriptedEntityClient(
+                [{"entities": [job_details(parameters={"Frames": {"chunkInt": "1-10"}})], "errors": []}]
+            )
+        )
+        details = entities.job_details()
+        self.assertEqual(details.parameters["Frames"].type.value, "CHUNK[INT]")
+
+    def test_job_parameters_unwrap_the_four_types_the_api_defines(self):
+        details = job_entities(
+            ScriptedEntityClient(
+                [
+                    {
+                        "entities": [
+                            job_details(
+                                parameters={
+                                    "A": {"string": "s"},
+                                    "B": {"int": "1"},
+                                    "C": {"float": "2.5"},
+                                    "D": {"path": "/p"},
+                                }
+                            )
+                        ],
+                        "errors": [],
+                    }
+                ]
+            )
+        ).job_details()
+        self.assertEqual(
+            {name: value.type.value for name, value in details.parameters.items()},
             {"A": "STRING", "B": "INT", "C": "FLOAT", "D": "PATH"},
         )
 
     def test_an_unrecognized_tag_is_refused_rather_than_dropped(self):
         # Passing the action a parameter the template asked for, minus its value, would fail
         # inside the session with a far worse message.
-        with self.assertRaises(worker_protocol.WorkerProtocolError) as caught:
-            worker_protocol.unwrap_parameters({"Odd": {"unexpected": "v"}}, task=True)
+        with self.assertRaises(ValueError) as caught:
+            worker_protocol.unwrap_parameters({"Odd": {"unexpected": "v"}})
         self.assertIn("Odd", str(caught.exception))
 
     def test_no_parameters_is_not_an_error(self):
-        self.assertEqual(worker_protocol.unwrap_parameters(None, task=True), {})
+        self.assertEqual(worker_protocol.unwrap_parameters(None), {})
 
 
 class TestSessionSummarization(unittest.TestCase):
@@ -140,16 +176,17 @@ class TestSessionSummarization(unittest.TestCase):
 
 class TestCapabilities(unittest.TestCase):
     def test_declares_the_targeting_attribute(self):
-        capabilities = worker_protocol.default_capabilities()
+        capabilities = worker_protocol.default_capabilities().for_update_worker()
         attributes = {a["name"]: a["values"] for a in capabilities["attributes"]}
         # Job templates target this attribute, and the fleet must declare it too.
         self.assertEqual(attributes["attr.durable.lambda"], ["true"])
 
     def test_standard_capability_names_are_used(self):
-        capabilities = worker_protocol.default_capabilities()
+        capabilities = worker_protocol.default_capabilities().for_update_worker()
         amounts = {a["name"] for a in capabilities["amounts"]}
         attributes = {a["name"] for a in capabilities["attributes"]}
-        # Open Job Description reserves the `amount.worker` and `attr.worker` prefixes.
+        # Open Job Description reserves the `amount.worker` and `attr.worker` prefixes, and the
+        # worker agent's Capabilities model validates every name against them.
         self.assertIn("amount.worker.vcpu", amounts)
         self.assertIn("amount.worker.memory", amounts)
         self.assertIn("attr.worker.os.family", attributes)
@@ -157,17 +194,13 @@ class TestCapabilities(unittest.TestCase):
 
     def test_memory_and_vcpu_come_from_the_runtimes_own_setting(self):
         with mock.patch.dict("os.environ", {"AWS_LAMBDA_FUNCTION_MEMORY_SIZE": "3538"}):
-            amounts = {
-                a["name"]: a["value"] for a in worker_protocol.default_capabilities()["amounts"]
-            }
+            amounts = worker_protocol.default_capabilities().amounts
         self.assertEqual(amounts["amount.worker.memory"], 3538)
         # Lambda gives one vCPU per 1769 MB.
         self.assertEqual(amounts["amount.worker.vcpu"], 2)
 
     def test_scratch_space_is_reported_now_that_sessions_write_files(self):
-        amounts = {
-            a["name"]: a["value"] for a in worker_protocol.default_capabilities()["amounts"]
-        }
+        amounts = worker_protocol.default_capabilities().amounts
         self.assertEqual(amounts["amount.worker.disk.scratch"], worker_protocol.SCRATCH_MIB)
         self.assertGreater(worker_protocol.SCRATCH_MIB, 0)
 
@@ -178,34 +211,241 @@ def _deadline_client():
     )
 
 
-# The members the API marks required. Spelled out because Stubber validates against the model,
-# which is what makes these stubbed responses evidence about the real wire shape.
-def _job_details(**extra):
-    return {
-        "jobDetails": {
-            "jobId": JOB_ID,
-            "logGroupName": "/aws/deadline/farm-x/queue-y",
-            "schemaVersion": "jobtemplate-2023-09",
-            **extra,
-        }
-    }
-
-
-def _step_details(template=None, **extra):
-    return {
-        "stepDetails": {
-            "jobId": JOB_ID,
-            "stepId": "step-1",
-            "schemaVersion": "jobtemplate-2023-09",
-            "template": template if template is not None else {"name": "Generate"},
-            "dependencies": [],
-            **extra,
-        }
-    }
-
-
 class TestJobEntityFetching(unittest.TestCase):
-    """One call per action, because each round trip happens inside a billed invocation."""
+    """One warmed call per action, because each round trip happens inside a billed invocation."""
+
+    def test_the_api_limit_is_read_from_the_model_rather_than_assumed(self):
+        entities = job_entities(AnyEntityClient())
+        self.assertEqual(entities._get_max_entities_per_batch_get_job_entity_request(), 10)
+
+    def test_more_identifiers_than_the_api_allows_are_split_across_calls(self):
+        client = AnyEntityClient()
+        entities = job_entities(client)
+        entities.cache_entities(
+            [
+                worker_protocol.action_identifiers(job_id=JOB_ID, step_id=f"step-{i}")[1]
+                for i in range(11)
+            ]
+        )
+        # The worker agent chunks to the model's limit rather than failing the request.
+        self.assertEqual([len(call) for call in client.calls], [10, 1])
+
+    def test_job_details_and_a_step_template_arrive_from_a_single_call(self):
+        client = ScriptedEntityClient(
+            [{"entities": [job_details(), step_details()], "errors": []}]
+        )
+        entities = job_entities(client)
+        entities.cache_entities(
+            worker_protocol.action_identifiers(job_id=JOB_ID, step_id="step-1")
+        )
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(entities.step_details(step_id="step-1").step_template.name, "Generate")
+        self.assertEqual(entities.job_details().log_group_name, "/aws/deadline/farm-x/queue-y")
+        # Cached, so reading them cost no further round trips.
+        self.assertEqual(len(client.calls), 1)
+
+    def test_an_error_names_the_entity_and_the_service_code(self):
+        client = ScriptedEntityClient(
+            [
+                {
+                    "entities": [],
+                    "errors": [
+                        entity_error(
+                            "stepDetails",
+                            "ResourceNotFoundException",
+                            "no such step",
+                            stepId="step-1",
+                        )
+                    ],
+                }
+            ]
+        )
+        entities = job_entities(client)
+        with self.assertRaises(RuntimeError) as caught:
+            entities.step_details(step_id="step-1")
+        self.assertIn("ResourceNotFoundException", str(caught.exception))
+        self.assertIn("no such step", str(caught.exception))
+
+    def test_an_oversized_entity_is_re_requested_on_its_own(self):
+        # A step template with large embedded files does not fit in a response alongside
+        # anything else. The warming call leaves it uncached rather than failing, and asking
+        # for it then fetches it alone.
+        client = ScriptedEntityClient(
+            [
+                {
+                    "entities": [job_details()],
+                    "errors": [
+                        entity_error(
+                            "stepDetails", "MaxPayloadSizeExceeded", "too big", stepId="step-1"
+                        )
+                    ],
+                },
+                {"entities": [step_details()], "errors": []},
+            ]
+        )
+        entities = job_entities(client)
+        entities.cache_entities(
+            worker_protocol.action_identifiers(job_id=JOB_ID, step_id="step-1")
+        )
+        self.assertEqual(entities.step_details(step_id="step-1").step_id, "step-1")
+        self.assertEqual([len(call) for call in client.calls], [2, 1])
+
+    def test_an_entity_neither_returned_nor_reported_is_an_error(self):
+        # Running the action without it would use defaults the job never asked for.
+        client = ScriptedEntityClient([{"entities": [job_details()], "errors": []}])
+        entities = job_entities(client)
+        entities.cache_entities(
+            worker_protocol.action_identifiers(job_id=JOB_ID, step_id="step-1")
+        )
+        with self.assertRaises(RuntimeError):
+            entities.step_details(step_id="step-1")
+
+    def test_a_missing_botocore_operation_is_refused_rather_than_faked(self):
+        # DeadlineClient answers an operation the model lacks with a hard-coded response, and
+        # a fabricated job is worse than a failure.
+        worker = worker_protocol.DeadlineWorker(
+            farm_id=harness.FARM_ID,
+            fleet_id=harness.FLEET_ID,
+            region="us-west-2",
+            worker_id=WORKER_ID,
+        )
+        worker._client_cache[True] = object()
+        worker._worker_credentials = object()
+        with self.assertRaises(worker_protocol.DeadlineRequestUnrecoverableError):
+            worker.job_entities(job_id=JOB_ID)
+
+
+class TestRunActionStep(unittest.TestCase):
+    """The step that fetches what one action needs and hands it to the session runner."""
+
+    def _run(self, action_dict, *, job_fields=None, env_layers=None):
+        worker = stub_worker(AnyEntityClient(job_fields=job_fields))
+        with stub_session_runner() as runner, mock.patch.object(
+            durable_worker, "DeadlineWorker", return_value=worker
+        ):
+            outcome = durable_worker.run_action(
+                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, action_dict, env_layers or []
+            )
+        return outcome, runner, worker
+
+    def test_job_details_and_the_step_template_are_asked_for_together(self):
+        _, _, worker = self._run(task_run_action())
+        self.assertEqual(
+            worker.entity_client.calls[0],
+            [
+                {"jobDetails": {"jobId": JOB_ID}},
+                {"stepDetails": {"jobId": JOB_ID, "stepId": "step-1"}},
+            ],
+        )
+
+    def test_an_environment_action_asks_for_the_environment_template(self):
+        _, _, worker = self._run(harness.env_enter_action(environment_id="env-7"))
+        self.assertEqual(
+            worker.entity_client.calls[0][1],
+            {"environmentDetails": {"jobId": JOB_ID, "environmentId": "env-7"}},
+        )
+
+    def test_job_parameters_reach_the_session_unwrapped(self):
+        _, runner, _ = self._run(
+            task_run_action(), job_fields={"parameters": {"ModelId": {"string": "luma.ray-v2:0"}}}
+        )
+        model_id = runner.calls[0]["job_parameters"]["ModelId"]
+        self.assertEqual((model_id.type.value, model_id.value), ("STRING", "luma.ray-v2:0"))
+
+    def test_task_parameters_reach_the_session_unwrapped(self):
+        _, runner, _ = self._run(task_run_action())
+        prompt = runner.calls[0]["task_parameters"]["Prompt"]
+        self.assertEqual((prompt.type.value, prompt.value), ("STRING", "a car"))
+
+    def test_path_mapping_rules_are_passed_through_rather_than_reimplemented(self):
+        rules = [
+            {"sourcePathFormat": "windows", "sourcePath": "Z:\\", "destinationPath": "/mnt/z"}
+        ]
+        _, runner, _ = self._run(task_run_action(), job_fields={"pathMappingRules": rules})
+        # Translated into the library's own spelling by the worker agent, not by this sample.
+        rule = runner.calls[0]["path_mapping_rules"][0]
+        self.assertEqual(str(rule.source_path), "Z:\\")
+        self.assertEqual(str(rule.destination_path), "/mnt/z")
+
+    def test_the_queue_role_is_assumed_when_the_job_names_one(self):
+        _, runner, worker = self._run(
+            task_run_action(), job_fields={"queueRoleArn": "arn:aws:iam::1:role/QueueRole"}
+        )
+        worker.assume_queue_role.assert_called_once_with(queue_id=QUEUE_ID)
+        # This is what keeps a task's script off the worker's own identity.
+        self.assertEqual(runner.calls[0]["os_env_vars"]["AWS_ACCESS_KEY_ID"], "AKIAQUEUE")
+
+    def test_without_a_queue_role_the_task_gets_no_credentials_at_all(self):
+        _, runner, worker = self._run(task_run_action())
+        worker.assume_queue_role.assert_not_called()
+        # Inherited credentials would be the worker's own, so they are removed instead.
+        self.assertIsNone(runner.calls[0]["os_env_vars"]["AWS_ACCESS_KEY_ID"])
+
+    def test_a_protocol_failure_fails_one_action_rather_than_the_execution(self):
+        worker = mock.MagicMock()
+        worker.job_entities.side_effect = worker_protocol.DeadlineRequestUnrecoverableError(
+            ValueError("no such job")
+        )
+        with stub_session_runner(), mock.patch.object(
+            durable_worker, "DeadlineWorker", return_value=worker
+        ), self.assertLogs("durable-step", level="ERROR"):
+            outcome = durable_worker.run_action(
+                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, task_run_action(), []
+            )
+        self.assertEqual(outcome["state"], "FAILED")
+        self.assertIn("no such job", outcome["message"])
+        self.assertEqual(outcome["awaitTokens"], [])
+
+    def test_a_request_that_gave_up_retrying_leaves_the_action_unattempted(self):
+        # Reporting FAILED would spend the task's retry budget on a throttle.
+        worker = mock.MagicMock()
+        worker.job_entities.side_effect = worker_protocol.DeadlineRequestInterrupted("gave up")
+        with stub_session_runner(), mock.patch.object(
+            durable_worker, "DeadlineWorker", return_value=worker
+        ), self.assertLogs("durable-step", level="WARNING"):
+            outcome = durable_worker.run_action(
+                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, task_run_action(), []
+            )
+        self.assertEqual(outcome["state"], "RETRY_LATER")
+        self.assertNotIn("endedAt", outcome)
+
+    def test_an_unexpected_defect_fails_one_action_rather_than_the_execution(self):
+        worker = mock.MagicMock()
+        worker.job_entities.side_effect = ZeroDivisionError("boom")
+        with stub_session_runner(), mock.patch.object(
+            durable_worker, "DeadlineWorker", return_value=worker
+        ), self.assertLogs("durable-step", level="ERROR"):
+            outcome = durable_worker.run_action(
+                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, task_run_action(), []
+            )
+        self.assertEqual(outcome["state"], "FAILED")
+        self.assertIn("ZeroDivisionError", outcome["message"])
+
+    def test_an_unparseable_template_fails_one_action_rather_than_the_worker(self):
+        # openjd-model 0.11.x raises IndexError rather than its own DecodeValidationError when
+        # the invalid field is the template root, so what is pinned here is the outcome: one
+        # failed action carrying a message, whatever the library chose to raise.
+        worker = stub_worker(AnyEntityClient(template={"name": "Config"}))
+        with stub_session_runner(), mock.patch.object(
+            durable_worker, "DeadlineWorker", return_value=worker
+        ), self.assertLogs("durable-step", level="ERROR"):
+            outcome = durable_worker.run_action(
+                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, harness.env_enter_action(), []
+            )
+        self.assertEqual(outcome["state"], "FAILED")
+        self.assertTrue(outcome["message"])
+
+    def test_every_outcome_carries_the_ended_at_the_service_requires(self):
+        outcome, _, _ = self._run(task_run_action())
+        self.assertTrue(outcome["endedAt"])
+
+
+class TestErrorTaxonomy(unittest.TestCase):
+    """Which service errors end a worker, and which only end one request.
+
+    The classification is the worker agent's. These pin the cases this worker acts on, because
+    getting one wrong either abandons assigned work or keeps a dead worker polling.
+    """
 
     def _worker(self, client):
         worker = worker_protocol.DeadlineWorker(
@@ -218,235 +458,59 @@ class TestJobEntityFetching(unittest.TestCase):
         worker._worker_credentials = object()
         return worker
 
-    def test_the_api_limit_is_read_from_the_model_rather_than_assumed(self):
-        self.assertEqual(worker_protocol._max_identifiers(_deadline_client()), 10)
-
-    def test_job_details_and_a_step_template_arrive_from_a_single_call(self):
+    def _stubbed(self, method, code, **modeled):
+        # The modeled members the error shapes mark required, so Stubber validates these
+        # against the service model rather than inventing a shape the service never sends.
+        fields = {"message": "simulated", "resourceId": WORKER_ID, "resourceType": "worker"}
+        if code == "ConflictException":
+            fields["reason"] = "STATUS_CONFLICT"
+        fields.update(modeled)
         client = _deadline_client()
         stubber = Stubber(client)
-        stubber.add_response(
-            "batch_get_job_entity",
-            {"entities": [_job_details(), _step_details()], "errors": []},
-            {"farmId": ANY, "fleetId": ANY, "workerId": ANY, "identifiers": ANY},
+        stubber.add_client_error(
+            method, service_error_code=code, service_message="simulated", modeled_fields=fields
         )
         stubber.activate()
+        return self._worker(client)
 
-        entities = self._worker(client).get_job_entities(
-            identifiers=[
-                {"jobDetails": {"jobId": JOB_ID}},
-                {"stepDetails": {"jobId": JOB_ID, "stepId": "step-1"}},
-            ]
+    def test_a_deleted_worker_ends_the_poll_loop(self):
+        worker = self._stubbed("update_worker_schedule", "ResourceNotFoundException")
+        with self.assertRaises(worker_protocol.DeadlineRequestWorkerNotFound):
+            worker.update_worker_schedule()
+
+    def test_a_worker_taken_out_of_started_ends_the_poll_loop_too(self):
+        worker = self._stubbed(
+            "update_worker_schedule",
+            "ConflictException",
+            reason="STATUS_CONFLICT",
+            resourceId=WORKER_ID,
         )
-        stubber.assert_no_pending_responses()
-        self.assertEqual(set(entities), {"jobDetails", "stepDetails"})
-        self.assertEqual(entities["stepDetails"]["template"], {"name": "Generate"})
+        with self.assertRaises(worker_protocol.DeadlineRequestWorkerOfflineError) as caught:
+            worker.update_worker_schedule()
+        # Both remedies are the same, so the loop catches them together.
+        self.assertIsInstance(caught.exception, worker_protocol.WORKER_UNUSABLE)
 
-    def test_asking_for_more_identifiers_than_the_api_allows_is_refused(self):
-        worker = self._worker(_deadline_client())
-        with self.assertRaises(worker_protocol.WorkerProtocolError):
-            worker.get_job_entities(
-                identifiers=[{"jobDetails": {"jobId": JOB_ID}}] * 11
-            )
-
-    def test_an_error_names_the_entity_and_the_service_code(self):
-        client = _deadline_client()
-        stubber = Stubber(client)
-        stubber.add_response(
-            "batch_get_job_entity",
-            {
-                "entities": [],
-                "errors": [
-                    {
-                        "stepDetails": {
-                            "jobId": JOB_ID,
-                            "stepId": "step-1",
-                            "code": "ResourceNotFoundException",
-                            "message": "no such step",
-                        }
-                    }
-                ],
-            },
-            {"farmId": ANY, "fleetId": ANY, "workerId": ANY, "identifiers": ANY},
+    def test_a_conflict_in_another_resource_is_not_a_reason_to_stop(self):
+        worker = self._stubbed(
+            "update_worker_schedule",
+            "ConflictException",
+            reason="STATUS_CONFLICT",
+            resourceId="queue-other",
         )
-        stubber.activate()
-        with self.assertRaises(worker_protocol.WorkerProtocolError) as caught:
-            self._worker(client).get_job_entities(
-                identifiers=[{"stepDetails": {"jobId": JOB_ID, "stepId": "step-1"}}]
-            )
-        self.assertIn("ResourceNotFoundException", str(caught.exception))
-        self.assertIn("no such step", str(caught.exception))
+        with self.assertRaises(worker_protocol.DeadlineRequestUnrecoverableError) as caught:
+            worker.update_worker_schedule()
+        self.assertNotIsInstance(caught.exception, worker_protocol.WORKER_UNUSABLE)
 
-    def test_an_oversized_entity_is_re_requested_on_its_own(self):
-        # A step template with large embedded files does not fit in a response alongside
-        # anything else, and the whole call fails rather than that one entity.
-        client = _deadline_client()
-        stubber = Stubber(client)
-        stubber.add_response(
-            "batch_get_job_entity",
-            {
-                "entities": [_job_details()],
-                "errors": [
-                    {
-                        "stepDetails": {
-                            "jobId": JOB_ID,
-                            "stepId": "step-1",
-                            "code": "MaxPayloadSizeExceeded",
-                            "message": "too big",
-                        }
-                    }
-                ],
-            },
-            {"farmId": ANY, "fleetId": ANY, "workerId": ANY, "identifiers": ANY},
-        )
-        stubber.add_response(
-            "batch_get_job_entity",
-            {"entities": [_step_details(template={})], "errors": []},
-            {"farmId": ANY, "fleetId": ANY, "workerId": ANY, "identifiers": ANY},
-        )
-        stubber.activate()
+    def test_deleting_a_worker_that_is_already_gone_is_not_an_error(self):
+        worker = self._stubbed("delete_worker", "ResourceNotFoundException")
+        worker.delete_worker()
 
-        entities = self._worker(client).get_job_entities(
-            identifiers=[
-                {"jobDetails": {"jobId": JOB_ID}},
-                {"stepDetails": {"jobId": JOB_ID, "stepId": "step-1"}},
-            ]
-        )
-        stubber.assert_no_pending_responses()
-        self.assertEqual(set(entities), {"jobDetails", "stepDetails"})
-
-    def test_an_entity_neither_returned_nor_reported_is_an_error(self):
-        # Running the action without it would use defaults the job never asked for.
-        client = _deadline_client()
-        stubber = Stubber(client)
-        stubber.add_response(
-            "batch_get_job_entity",
-            {"entities": [_job_details()], "errors": []},
-            {"farmId": ANY, "fleetId": ANY, "workerId": ANY, "identifiers": ANY},
-        )
-        stubber.activate()
-        with self.assertRaises(worker_protocol.WorkerProtocolError) as caught:
-            self._worker(client).get_job_entities(
-                identifiers=[
-                    {"jobDetails": {"jobId": JOB_ID}},
-                    {"stepDetails": {"jobId": JOB_ID, "stepId": "step-1"}},
-                ]
-            )
-        self.assertIn("stepDetails", str(caught.exception))
-
-
-class TestRunActionStep(unittest.TestCase):
-    """The step that fetches what one action needs and hands it to the session runner."""
-
-    def _run(self, action_dict, *, job_details=None, env_layers=None):
-        worker = mock.MagicMock()
-        worker.get_job_entities.return_value = {
-            "jobDetails": job_details
-            if job_details is not None
-            else {"jobId": JOB_ID, "parameters": {}},
-            "stepDetails": {"template": {"name": "Generate"}},
-            "environmentDetails": {"template": {"name": "Config"}},
-        }
-        worker.assume_queue_role.return_value = {
-            "accessKeyId": "AKIAQUEUE",
-            "secretAccessKey": "s",
-            "sessionToken": "t",
-            "expiration": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        }
-        with stub_session_runner() as runner, mock.patch.object(
-            durable_worker, "DeadlineWorker", return_value=worker
-        ):
-            outcome = durable_worker.run_action(
-                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, action_dict, env_layers or []
-            )
-        return outcome, runner, worker
-
-    def test_job_details_and_the_step_template_are_asked_for_together(self):
-        _, _, worker = self._run(task_run_action())
-        identifiers = worker.get_job_entities.call_args.kwargs["identifiers"]
-        self.assertEqual(len(identifiers), 1 + 1)
-        self.assertEqual(
-            identifiers,
-            [
-                {"jobDetails": {"jobId": JOB_ID}},
-                {"stepDetails": {"jobId": JOB_ID, "stepId": "step-1"}},
-            ],
-        )
-
-    def test_an_environment_action_asks_for_the_environment_template(self):
-        _, _, worker = self._run(harness.env_enter_action(environment_id="env-7"))
-        identifiers = worker.get_job_entities.call_args.kwargs["identifiers"]
-        self.assertEqual(
-            identifiers[1], {"environmentDetails": {"jobId": JOB_ID, "environmentId": "env-7"}}
-        )
-
-    def test_job_parameters_reach_the_session_unwrapped(self):
-        _, runner, _ = self._run(
-            task_run_action(),
-            job_details={"jobId": JOB_ID, "parameters": {"ModelId": {"string": "luma.ray-v2:0"}}},
-        )
-        self.assertEqual(
-            runner.calls[0]["job_parameters"],
-            {"ModelId": {"type": "STRING", "value": "luma.ray-v2:0"}},
-        )
-
-    def test_task_parameters_reach_the_session_unwrapped(self):
-        _, runner, _ = self._run(task_run_action())
-        self.assertEqual(
-            runner.calls[0]["task_parameters"], {"Prompt": {"type": "STRING", "value": "a car"}}
-        )
-
-    def test_path_mapping_rules_are_passed_through_rather_than_reimplemented(self):
-        rules = [
-            {"sourcePathFormat": "windows", "sourcePath": "Z:\\", "destinationPath": "/mnt/z"}
-        ]
-        _, runner, _ = self._run(
-            task_run_action(), job_details={"jobId": JOB_ID, "pathMappingRules": rules}
-        )
-        self.assertEqual(runner.calls[0]["path_mapping_rules"], rules)
-
-    def test_the_queue_role_is_assumed_when_the_job_names_one(self):
-        _, runner, worker = self._run(
-            task_run_action(),
-            job_details={"jobId": JOB_ID, "queueRoleArn": "arn:aws:iam::1:role/QueueRole"},
-        )
-        worker.assume_queue_role.assert_called_once_with(queue_id=QUEUE_ID)
-        # This is what keeps a task's script off the worker's own identity.
-        self.assertEqual(runner.calls[0]["os_env_vars"]["AWS_ACCESS_KEY_ID"], "AKIAQUEUE")
-
-    def test_without_a_queue_role_the_task_gets_no_credentials_at_all(self):
-        _, runner, worker = self._run(task_run_action(), job_details={"jobId": JOB_ID})
-        worker.assume_queue_role.assert_not_called()
-        # Inherited credentials would be the worker's own, so they are removed instead.
-        self.assertIsNone(runner.calls[0]["os_env_vars"]["AWS_ACCESS_KEY_ID"])
-
-    def test_a_protocol_failure_fails_one_action_rather_than_the_execution(self):
-        worker = mock.MagicMock()
-        worker.get_job_entities.side_effect = worker_protocol.WorkerProtocolError("no such job")
-        with stub_session_runner(), mock.patch.object(
-            durable_worker, "DeadlineWorker", return_value=worker
-        ), self.assertLogs("durable-step", level="ERROR"):
-            outcome = durable_worker.run_action(
-                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, task_run_action(), []
-            )
-        self.assertEqual(outcome["state"], "FAILED")
-        self.assertIn("no such job", outcome["message"])
-        self.assertEqual(outcome["awaitTokens"], [])
-
-    def test_an_unexpected_defect_fails_one_action_rather_than_the_execution(self):
-        worker = mock.MagicMock()
-        worker.get_job_entities.side_effect = ZeroDivisionError("boom")
-        with stub_session_runner(), mock.patch.object(
-            durable_worker, "DeadlineWorker", return_value=worker
-        ), self.assertLogs("durable-step", level="ERROR"):
-            outcome = durable_worker.run_action(
-                WORKER_ID, "session-1", QUEUE_ID, JOB_ID, task_run_action(), []
-            )
-        self.assertEqual(outcome["state"], "FAILED")
-        self.assertIn("ZeroDivisionError", outcome["message"])
-
-    def test_every_outcome_carries_the_ended_at_the_service_requires(self):
-        outcome, _, _ = self._run(task_run_action())
-        self.assertTrue(outcome["endedAt"])
+    def test_a_worker_the_service_removed_needs_no_draining(self):
+        # UpdateWorker reports it as conditionally recoverable rather than as not-found, which
+        # is why the drain step catches that class as well.
+        worker = self._stubbed("update_worker", "ResourceNotFoundException")
+        with self.assertRaises(worker_protocol.WORKER_UNDRAINABLE):
+            worker.update_worker_status(status=worker_protocol.WorkerStatus.STOPPING)
 
 
 class TestTimestampSerialization(unittest.TestCase):
@@ -498,7 +562,7 @@ class TestWorkerCredentials(unittest.TestCase):
 
     def test_a_worker_id_is_required_before_the_role_can_be_assumed(self):
         worker = self._worker()
-        with self.assertRaises(worker_protocol.WorkerProtocolError):
+        with self.assertRaises(worker_protocol.DeadlineRequestUnrecoverableError):
             worker.update_worker_schedule()
 
     def test_the_fleet_role_is_assumed_on_first_use(self):
