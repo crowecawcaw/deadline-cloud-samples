@@ -207,6 +207,11 @@ exact commands.
 - Missing DCC-specific runtime libraries in the container: the DCC won't launch
   and the recipe test will fail
 - Forgetting `conda index` after building: the package won't be discoverable
+- Indexing with `rattler-index` 0.31+ or `rattler-build publish` 0.75+: the index
+  they write cannot be parsed by a service-managed fleet, and every job fails with
+  `openjd_fail: failed to load repodata`. Constrain the tools to
+  `rattler-index<0.31` and `rattler-build<0.75`, or repair the channel with
+  [`utility_scripts/repair_conda_channel`](../../utility_scripts/repair_conda_channel/)
 - Guessing SHA256 hashes: always fetch from the vendor's official hash file
 - Running a full-resolution render for a smoke test: use low resolution + low
   samples for a fast check (~5-10 seconds)

@@ -80,9 +80,17 @@ if conda env list | grep -q "^$ENV_NAME "; then
 else
     echo "Creating the named Conda environment $ENV_NAME for running conda-build."
 
+    # The upper bounds on rattler-build and rattler-index keep the channel index
+    # readable by the Conda queue environment on a service-managed fleet. Newer
+    # versions write an "info.repodata_revisions" field and a sharded index that
+    # the fleet cannot parse, and every job then fails while the queue
+    # environment starts, with "openjd_fail: failed to load repodata" in the
+    # session log. Raise these bounds only after the fleet reads the newer
+    # format. To repair a channel that a newer version already indexed, see
+    # utility_scripts/repair_conda_channel/.
     conda create --yes --quiet -n "$ENV_NAME" \
         --override-channels -c conda-forge \
-        python=3.13 conda conda-build "rattler-build>=0.48.1" "rattler-index>=0.26" boto3 pyyaml
+        python=3.13 conda conda-build "rattler-build>=0.48.1,<0.75" "rattler-index>=0.26,<0.31" boto3 pyyaml
 
     # Activate the Conda environment, capturing the environment variables for the session to use
     python "$(dirname "$0")/openjd-vars-start.py" .vars

@@ -55,6 +55,11 @@ rattler-build publish infinigen-1.19.0/recipe/recipe.yaml \
     --build-number=+1
 ```
 
+> Constrain the tool to `rattler-build<0.75` (or `rattler-index<0.31`), or repair the channel
+> after publishing. Newer versions write an index that a service-managed fleet cannot read, and
+> every job then fails with `openjd_fail: failed to load repodata`. See
+> [Troubleshooting](../README.md#openjd_fail-failed-to-load-repodata).
+
 If your machine has no CUDA GPU but you still want to build the package, the
 terrain compilation step falls back to a CPU-only build automatically. You
 will need a GPU at runtime to use the nature (terrain) scene type.

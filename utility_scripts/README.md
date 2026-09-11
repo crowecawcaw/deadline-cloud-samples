@@ -8,8 +8,23 @@ This table covers every immediate user-selectable sample directory in `utility_s
 
 | Sample | What it demonstrates | Start here when |
 |---|---|---|
+| [Repair a Conda channel](repair_conda_channel/) | Removing the index artifacts that stop a service-managed fleet from reading a custom Conda channel | Jobs fail as the Conda queue environment starts, with `openjd_fail: failed to load repodata` |
 | [Upload to job attachments](upload_to_job_attachments/) | Uploading files into content-addressable job attachment storage with deduplication | Large or reused datasets should be staged before job submission |
 | [Virtual workstation](virtual_workstation/) | Provisioning a Linux or Windows workstation with a DCC, the Deadline Cloud submitter, and a pre-configured monitor profile | Artists should find a submission-ready machine and only need to sign in |
+
+## Repair a Conda channel
+
+`rattler-index` 0.31 and later, and `rattler-build publish` 0.75 and later, write a channel index that the Conda queue environment on a service-managed fleet cannot parse. Every job on the queue then fails while the environment starts, with `openjd_fail: failed to load repodata` in the session log, even though the same channel installs correctly on a workstation. This script removes the two artifacts responsible, in every subdirectory of the channel, and leaves a plain `repodata.json` that all Conda clients read.
+
+```console
+# Report what needs repair, and exit 1 when a repair is needed
+python repair_conda_channel/repair_conda_channel.py --check s3://my-bucket/Conda/Default
+
+# Apply the repair
+python repair_conda_channel/repair_conda_channel.py s3://my-bucket/Conda/Default
+```
+
+See the [sample README](repair_conda_channel/) for what changes, and for how to avoid publishing another broken channel.
 
 ## Upload to job attachments
 

@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from conftest import find_conda_recipe_dirs, rel, require_tool
+from conftest import REPO_ROOT, find_conda_recipe_dirs, rel, require_tool
 
 _RECIPE_DIRS = find_conda_recipe_dirs()
 
@@ -125,6 +125,32 @@ def test_recipe_directory_present(recipe_dir: Path):
     assert (recipe_subdir / "recipe.yaml").exists() or (
         recipe_subdir / "meta.yaml"
     ).exists(), f"{rel(recipe_subdir)} has neither recipe.yaml nor meta.yaml"
+
+
+def test_package_build_env_constrains_the_channel_indexers():
+    """The build environment must not install an indexer a fleet cannot read.
+
+    ``rattler-index`` 0.31 and later, and ``rattler-build`` 0.75 and later, write an
+    ``info.repodata_revisions`` field and a sharded index that the Conda queue
+    environment on a service-managed fleet cannot parse. A build environment that
+    installs them produces a channel where every job fails with
+    ``openjd_fail: failed to load repodata``. Raise these bounds only once fleets
+    read the newer format.
+    """
+    script = (
+        REPO_ROOT
+        / "conda_recipes"
+        / "conda_build_linux_package"
+        / "scripts"
+        / "enter-package-build-env.sh"
+    )
+    text = script.read_text(encoding="utf-8")
+    for spec in ('"rattler-build>=0.48.1,<0.75"', '"rattler-index>=0.26,<0.31"'):
+        assert spec in text, (
+            f"{rel(script)} must install {spec} so the channel index it writes stays "
+            "readable by service-managed fleets. See "
+            "utility_scripts/repair_conda_channel/ for the failure it prevents."
+        )
 
 
 @pytest.mark.parametrize("recipe_dir", _RATTLER_RECIPES, ids=rel)

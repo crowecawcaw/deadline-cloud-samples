@@ -36,6 +36,11 @@ rattler-build publish nerfstudio/recipe/recipe.yaml \
     --build-number=+1
 ```
 
+> Constrain the tool to `rattler-build<0.75` (or `rattler-index<0.31`), or repair the channel
+> after publishing. Newer versions write an index that a service-managed fleet cannot read, and
+> every job then fails with `openjd_fail: failed to load repodata`. See
+> [Troubleshooting](../README.md#openjd_fail-failed-to-load-repodata).
+
 If your machine has no CUDA GPU, you can override the CUDA detection and build the package anyway.
 You will need a GPU to run NeRF Studio itself, but you can get the package built without one.
 Run the following before the above `rattler-build` command:

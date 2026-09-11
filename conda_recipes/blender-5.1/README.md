@@ -24,6 +24,11 @@ rattler-build publish blender-5.1/recipe/recipe.yaml \
     --build-number=+1
 ```
 
+> Constrain the tool to `rattler-build<0.75` (or `rattler-index<0.31`), or repair the channel
+> after publishing. Newer versions write an index that a service-managed fleet cannot read, and
+> every job then fails with `openjd_fail: failed to load repodata`. See
+> [Troubleshooting](../README.md#openjd_fail-failed-to-load-repodata).
+
 ### Submit a build job to Deadline Cloud
 
 From the `conda_recipes` directory:

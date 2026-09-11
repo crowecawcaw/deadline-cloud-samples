@@ -75,6 +75,11 @@ Before building, update `recipe/recipe.yaml` to match your Unreal Engine install
 
    The channel can be on prefix.dev, anaconda.org, an S3 bucket, a local filesystem folder (or network mount), or a Quetz or Artifactory instance. See the [rattler-build publish documentation](https://rattler-build.prefix.dev/v0.55.0/publish/) for details.
 
+> Constrain the tool to `rattler-build<0.75` (or `rattler-index<0.31`), or repair the channel
+> after publishing. Newer versions write an index that a service-managed fleet cannot read, and
+> every job then fails with `openjd_fail: failed to load repodata`. See
+> [Troubleshooting](../README.md#openjd_fail-failed-to-load-repodata).
+
    > The build may take up to 90 minutes depending on your disk speed.
 
 ### Uploading a locally built conda package to S3

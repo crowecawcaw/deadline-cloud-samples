@@ -59,6 +59,11 @@ aws s3 cp output/win-64/ayon-launcher-*.conda s3://<your-bucket>/Conda/Default/w
 rattler-index s3 s3://<your-bucket>/Conda/Default
 ```
 
+> Constrain the tool to `rattler-build<0.75` (or `rattler-index<0.31`), or repair the channel
+> after publishing. Newer versions write an index that a service-managed fleet cannot read, and
+> every job then fails with `openjd_fail: failed to load repodata`. See
+> [Troubleshooting](../README.md#openjd_fail-failed-to-load-repodata).
+
 ## Queue configuration
 
 Add your conda channel to the queue's `CondaChannels` parameter:

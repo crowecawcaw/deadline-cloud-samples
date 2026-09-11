@@ -263,6 +263,50 @@ Any supported conda-build or rattler-build argument works here:
 
 The build arguments are parsed as space-separated values and added to the build command. Use quotes to group arguments that contain spaces.
 
+## Troubleshooting
+
+### `openjd_fail: failed to load repodata`
+
+Jobs that use your channel fail as the Conda queue environment starts, and the session log ends like this:
+
+```
+WARN rattler_repodata_gateway::fetch::with_cache: previous cache state does not contain cache_control header. Assuming out of date...
+openjd_fail: failed to load repodata
+Process pid 4486 exited with code: 1 (unsigned) / 0x1 (hex)
+```
+
+The channel index is the problem, not your package. `rattler-index` 0.31 and later, and
+`rattler-build publish` 0.75 and later, write an `info.repodata_revisions` field into `repodata.json`
+and a `repodata_shards.msgpack.zst` sharded index. A service-managed fleet cannot parse either one, so
+it fails before it reads the package list. A current `conda`, `pixi`, or `rattler` on your workstation
+reads the newer format without complaint, so the channel works locally and fails on the farm.
+Deleting the local Conda cache or publishing to a new channel does not help, because each new index has
+the same format.
+
+To repair an affected channel, run
+[`utility_scripts/repair_conda_channel`](../utility_scripts/repair_conda_channel/):
+
+```
+$ python ../utility_scripts/repair_conda_channel/repair_conda_channel.py s3://<my-bucket>/Conda/Default
+```
+
+To avoid publishing another broken channel:
+
+* The package build job bundles constrain the build environment to `rattler-build<0.75` and
+  `rattler-index<0.31`. A worker that already created its `PackageBuildEnv` keeps the newer versions it
+  installed, so recreate the environment once with the `ReusePackageBuildEnv` job parameter:
+
+  ```
+  jobParameters:
+    - name: ReusePackageBuildEnv
+      value: "0"
+  ```
+* Apply the same constraints when you index or publish a channel from your own workstation, or run the
+  repair script after each publish.
+* Avoid mixing indexers on one channel. `conda index` writes `repodata.json` and ignores an existing
+  `repodata_shards.msgpack.zst`, which leaves the sharded index describing an older package list.
+  Clients that read the sharded index then miss the package you just published.
+
 ## Recipe directory structure for `submit-package-job`
 
 The `submit-package-job` command expects rattler-build recipes in a specific directory structure. It's inspired by the
