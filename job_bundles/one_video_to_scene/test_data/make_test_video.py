@@ -24,7 +24,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir")
     parser.add_argument("--frames", type=int, default=72)
-    parser.add_argument("--resolution", type=int, nargs=2, default=[768, 512])
+    parser.add_argument("--resolution", type=int, nargs=2, default=[1920, 1280])
     return parser.parse_args(argv)
 
 

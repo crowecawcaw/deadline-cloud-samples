@@ -36,8 +36,6 @@ import yaml
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 STAGES = ["Analyze", "Reconstruct", "Register", "Assemble", "Render"]
-# Parameters that describe where a particular job reads and writes, so they're never reused.
-PER_JOB_PARAMETERS = {"OutputDir", "PriorOutputDir", "InputVideo"}
 
 
 def stage_dir_name(stage: str) -> str:
@@ -90,14 +88,17 @@ def deadline_cli(args, *cli_args) -> str:
     return result.stdout
 
 
-def get_job_parameters(args, job_id: str) -> dict:
-    """Return {name: value} for the parameters of a previous job."""
+def get_job_parameters(args, job_id: str):
+    """Return ({name: value}, {names of PATH parameters}) for a previous job."""
     job = yaml.safe_load(deadline_cli(args, "job", "get", "--job-id", job_id))
-    params = {}
+    params, path_params = {}, set()
     for name, typed_value in (job.get("parameters") or {}).items():
         # Each value is a single-key dict like {"string": "..."} or {"path": "..."}.
-        params[name] = str(next(iter(typed_value.values())))
-    return params
+        ((kind, value),) = typed_value.items()
+        params[name] = str(value)
+        if kind == "path":
+            path_params.add(name)
+    return params, path_params
 
 
 def download_stage_outputs(args, job_id: str, job_output_dir: str, stage: str):
@@ -165,8 +166,10 @@ def main():
 
     params = {}
     if args.from_job:
-        prior_params = get_job_parameters(args, args.from_job)
-        params.update({k: v for k, v in prior_params.items() if k not in PER_JOB_PARAMETERS})
+        prior_params, path_params = get_job_parameters(args, args.from_job)
+        # Paths (the video, output directories, the bundle's script directory) belong to that
+        # job, so only reuse the other parameters.
+        params.update({k: v for k, v in prior_params.items() if k not in path_params})
         if skip:
             prior_dir = output_dir.parent / f"{output_dir.name}_prior"
             gather_prior_outputs(args, prior_params, skip, prior_dir)

@@ -73,7 +73,7 @@ def extract_frames(video: Path, num_frames: int, frame_size: int, frames_dir: Pa
     # Playback rate that keeps the sampled frames at the video's real-time speed.
     fps = src_fps * (len(frame_paths) - 1) / max(indices[-1] - indices[0], 1)
     print(f"Sampled {len(frame_paths)} of {total} frames, effective {fps:.2f} fps")
-    return frame_paths, fps
+    return frame_paths, fps, indices
 
 
 def parse_json_list(text: str):
@@ -215,15 +215,37 @@ def best_crop_frame(mask_stack):
     return int(np.argmax(score))
 
 
-def save_crop(frame_path: Path, mask, path: Path):
-    rgb = np.asarray(Image.open(frame_path).convert("RGB"))
-    ys, xs = np.nonzero(mask)
+def read_source_frame(video: Path, index: int):
+    """Decode one frame of the source video at its native resolution."""
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(video), "-vf", f"select='eq(n\\,{index})'", "-frames:v", "1",
+             f"{tmp}/frame.png"],
+            check=True,
+        )
+        return np.asarray(Image.open(f"{tmp}/frame.png").convert("RGB"))
+
+
+def save_crop(rgb, mask, path: Path, min_size=300):
+    """Save an RGBA crop around the mask from a frame that may be larger than the mask.
+
+    TRELLIS produces flat, degenerate shapes from small crops, so crops come from the source video
+    at its native resolution, and the mask is upsampled with soft edges.
+    """
+    H, W = rgb.shape[:2]
+    soft = cv2.resize(mask.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+    soft = cv2.GaussianBlur(soft, (0, 0), sigmaX=max(W / mask.shape[1] * 0.5, 0.5))
+    ys, xs = np.nonzero(soft > 0.5)
     pad = int(0.15 * max(np.ptp(ys), np.ptp(xs))) + 4
-    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, rgb.shape[0])
-    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, rgb.shape[1])
-    alpha = (mask[y0:y1, x0:x1] * 255).astype(np.uint8)
-    rgba = np.dstack([rgb[y0:y1, x0:x1], alpha])
-    Image.fromarray(rgba, "RGBA").save(path)
+    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, H)
+    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, W)
+    alpha = (np.clip(soft[y0:y1, x0:x1], 0, 1) * 255).astype(np.uint8)
+    Image.fromarray(np.dstack([rgb[y0:y1, x0:x1], alpha]), "RGBA").save(path)
+    size = max(y1 - y0, x1 - x0)
+    if size < min_size:
+        print(f"WARNING: {path.name} is only {size}px. Objects this small often reconstruct as flat shapes; "
+              "use a higher-resolution video or move the camera closer.")
+    return size
 
 
 def main():
@@ -239,7 +261,7 @@ def main():
     out = stages.output_dir("analyze")
     frames_dir = out / "frames"
     print("openjd_status: Sampling frames")
-    frame_paths, fps = extract_frames(Path(args.video), args.num_frames, args.frame_size, frames_dir)
+    frame_paths, fps, source_indices = extract_frames(Path(args.video), args.num_frames, args.frame_size, frames_dir)
     W, H = Image.open(frame_paths[0]).size
 
     print("openjd_status: Labeling objects")
@@ -270,8 +292,9 @@ def main():
             continue
         obj["crop_frame"] = best_crop_frame(m)
         obj["crop"] = f"crops/obj_{obj['id']:02d}.png"
-        save_crop(frame_paths[obj["crop_frame"]], m[obj["crop_frame"]], out / obj["crop"])
-        print(f"Object {obj['id']} {obj['label']}: crop frame {obj['crop_frame']}")
+        source = read_source_frame(Path(args.video), int(source_indices[obj["crop_frame"]]))
+        obj["crop_size"] = save_crop(source, m[obj["crop_frame"]], out / obj["crop"])
+        print(f"Object {obj['id']} {obj['label']}: crop frame {obj['crop_frame']}, {obj['crop_size']}px")
 
     np.savez_compressed(out / "depth.npz", depth=depth.astype(np.float16))
     stages.write_json(out / "cameras.json", {"width": W, "height": H, "fps": fps, "frames": cameras})
