@@ -1,0 +1,290 @@
+specificationVersion: 'jobtemplate-2023-09'
+name: One Video to Scene
+description: >
+  Turn one video into an animated, object-level 3D scene. Labels objects with a vision-language
+  model, tracks their masks, estimates depth and camera motion, generates a mesh per object,
+  places and tracks the meshes in 3D, then assembles and renders the scene in Blender.
+  Use submit.py to submit, or to re-run from a later stage reusing a previous job's outputs.
+
+parameterDefinitions:
+
+# Inputs and outputs
+- name: InputVideo
+  description: >
+    The source video. Can be empty when the Analyze step is skipped by a restart from a previous job.
+  type: PATH
+  objectType: FILE
+  dataFlow: IN
+  userInterface:
+    control: CHOOSE_INPUT_FILE
+    label: Input Video
+    groupLabel: Inputs and Outputs
+    fileFilters:
+    - label: Video files
+      patterns: ["*.mp4", "*.mov", "*.mkv", "*.webm"]
+    - label: All files
+      patterns: ["*"]
+  default: ""
+- name: OutputDir
+  description: Each step writes its results to a subdirectory named after the step (analyze, reconstruct, ...).
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: OUT
+  userInterface:
+    control: CHOOSE_DIRECTORY
+    label: Output Directory
+    groupLabel: Inputs and Outputs
+  default: output
+- name: PriorOutputDir
+  description: >
+    Outputs of earlier steps from a previous job, laid out like OutputDir. A step reads its inputs
+    from OutputDir when an earlier step of this job produced them, and from here otherwise.
+    submit.py sets this when restarting from a later stage.
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: IN
+  userInterface:
+    control: CHOOSE_DIRECTORY
+    label: Prior Output Directory
+    groupLabel: Inputs and Outputs
+  default: ""
+
+# Pipeline options
+- name: NumFrames
+  description: Number of frames sampled evenly from the video.
+  type: INT
+  minValue: 2
+  maxValue: 300
+  userInterface:
+    control: SPIN_BOX
+    label: Frames
+    groupLabel: Pipeline
+  default: 48
+- name: FrameSize
+  description: Frames are resized so that their longest edge is this many pixels.
+  type: INT
+  minValue: 256
+  maxValue: 1536
+  userInterface:
+    control: SPIN_BOX
+    label: Frame Size
+    groupLabel: Pipeline
+  default: 768
+- name: MaxObjects
+  description: Maximum number of objects to reconstruct. Creates this many Reconstruct tasks; extras exit immediately.
+  type: INT
+  minValue: 1
+  maxValue: 32
+  userInterface:
+    control: SPIN_BOX
+    label: Max Objects
+    groupLabel: Pipeline
+  default: 6
+- name: ObjectHint
+  description: Optional text added to the labeling prompt, for example "only the items on the table".
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Object Hint
+    groupLabel: Pipeline
+  default: ""
+- name: VlmModel
+  description: Hugging Face model ID of the Qwen3-VL model that labels the objects.
+  type: STRING
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Labeling Model
+    groupLabel: Pipeline
+  allowedValues:
+  - Qwen/Qwen3-VL-8B-Instruct
+  - Qwen/Qwen3-VL-4B-Instruct
+  - Qwen/Qwen3-VL-2B-Instruct
+  default: Qwen/Qwen3-VL-8B-Instruct
+- name: Seed
+  type: INT
+  userInterface:
+    control: SPIN_BOX
+    label: Seed
+    groupLabel: Pipeline
+  default: 0
+- name: RenderSamples
+  description: Cycles samples per pixel for the comparison render.
+  type: INT
+  minValue: 1
+  userInterface:
+    control: SPIN_BOX
+    label: Render Samples
+    groupLabel: Pipeline
+  default: 32
+
+# Software environment
+- name: CondaPackages
+  type: STRING
+  description: >
+    Conda packages for the job. Requires a Conda queue environment like
+    https://github.com/aws-deadline/deadline-cloud-samples/blob/mainline/queue_environments/conda_queue_env_improved_caching.yaml.
+    Python ML dependencies are installed separately with uv into cached virtual environments.
+  userInterface:
+    control: LINE_EDIT
+    label: Conda Packages
+    groupLabel: Software Environment
+  default: blender=4.5 ffmpeg uv git
+- name: CondaChannels
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Conda Channels
+    groupLabel: Software Environment
+  default: deadline-cloud conda-forge
+- name: CacheDir
+  description: >
+    Directory for cached virtual environments, source checkouts, and model weights. Empty uses the
+    fleet's persistent volume when one is mounted, and the session directory otherwise.
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Cache Directory
+    groupLabel: Software Environment
+  default: ""
+
+# Hidden
+- name: JobScriptDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: IN
+  userInterface:
+    control: HIDDEN
+  default: scripts
+
+jobEnvironments:
+- name: PipelineEnv
+  description: Sets up stage directories and the cached Python virtual environments.
+  variables:
+    PYTHONUNBUFFERED: "1"
+    HF_HUB_DISABLE_PROGRESS_BARS: "1"
+    OUTPUT_DIR: "{{Param.OutputDir}}"
+    PRIOR_OUTPUT_DIR: "{{Param.PriorOutputDir}}"
+    SCRIPT_DIR: "{{Param.JobScriptDir}}"
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ["{{Param.JobScriptDir}}/setup_env.sh", "{{Param.CacheDir}}", "{{Session.WorkingDirectory}}"]
+        timeout: 3600
+
+steps:
+
+- name: Analyze
+  description: Sample frames, label objects, track masks, and estimate depth and cameras.
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - "{{Param.JobScriptDir}}/run_stage.sh"
+        - analyze
+        - --video
+        - "{{Param.InputVideo}}"
+        - --num-frames
+        - "{{Param.NumFrames}}"
+        - --frame-size
+        - "{{Param.FrameSize}}"
+        - --max-objects
+        - "{{Param.MaxObjects}}"
+        - --vlm-model
+        - "{{Param.VlmModel}}"
+        - --object-hint
+        - "{{Param.ObjectHint}}"
+        timeout: 3600
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
+
+- name: Reconstruct
+  description: Generate a textured mesh for one object from its best unoccluded crop.
+  parameterSpace:
+    taskParameterDefinitions:
+    - name: ObjectNumber
+      type: INT
+      range: "1-{{Param.MaxObjects}}"
+  dependencies:
+  - dependsOn: Analyze
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - "{{Param.JobScriptDir}}/run_stage.sh"
+        - reconstruct
+        - --object-number
+        - "{{Task.Param.ObjectNumber}}"
+        - --seed
+        - "{{Param.Seed}}"
+        timeout: 1800
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
+
+- name: Register
+  description: Fit each mesh to the object's depth points, track rigid objects, and fit the ground plane.
+  dependencies:
+  - dependsOn: Analyze
+  - dependsOn: Reconstruct
+  script:
+    actions:
+      onRun:
+        command: bash
+        args: ["{{Param.JobScriptDir}}/run_stage.sh", register]
+        timeout: 1800
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+
+- name: Assemble
+  description: Build the animated scene in Blender and export it as GLB and .blend.
+  dependencies:
+  - dependsOn: Analyze
+  - dependsOn: Reconstruct
+  - dependsOn: Register
+  script:
+    actions:
+      onRun:
+        command: bash
+        args: ["{{Param.JobScriptDir}}/run_stage.sh", assemble]
+        timeout: 1800
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+
+- name: Render
+  description: Render the scene from the recovered camera path and encode a side-by-side comparison video.
+  dependencies:
+  - dependsOn: Analyze
+  - dependsOn: Assemble
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - "{{Param.JobScriptDir}}/run_stage.sh"
+        - render
+        - --samples
+        - "{{Param.RenderSamples}}"
+        timeout: 3600
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+    amounts:
+    - name: amount.worker.gpu
+      min: 1

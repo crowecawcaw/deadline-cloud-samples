@@ -1,0 +1,32 @@
+# Python packages for every stage except the Blender ones. setup_env.sh installs them with uv
+# into a virtual environment cached by a hash of this file and of setup_env.sh.
+# All of these are MIT, Apache-2.0, or BSD licensed.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.5.1
+torchvision==0.20.1
+xformers==0.0.28.post3
+# Depth Anything 3 requires numpy<2
+numpy<2
+
+# Analyze: Qwen3-VL labeling, SAM 2.1 tracking, Depth Anything 3 depth and cameras
+transformers>=4.57,<5
+accelerate
+depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4
+
+# Reconstruct: TRELLIS (checked out by setup_env.sh, imported from PYTHONPATH)
+spconv-cu124
+easydict
+plyfile
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# Shared
+huggingface_hub
+safetensors
+opencv-python
+open3d
+trimesh
+scipy
+pillow
+imageio
+imageio-ffmpeg
