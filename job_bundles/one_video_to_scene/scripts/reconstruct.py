@@ -67,7 +67,12 @@ def main():
     vertices = mesh.vertices.detach().cpu().numpy().astype(np.float64)
     faces = mesh.faces.detach().cpu().numpy()
     colors = mesh.vertex_attrs[:, :3].clamp(0, 1).detach().cpu().numpy()
-    print(f"TRELLIS mesh: {len(vertices)} vertices, {len(faces)} faces")
+    print(f"TRELLIS mesh: {len(vertices)} vertices, {len(faces)} faces, extent {np.round(np.ptp(vertices, 0), 3)}")
+    out = stages.output_dir("reconstruct") / f"obj_{obj['id']:02d}"
+    out.mkdir(parents=True, exist_ok=True)
+    trimesh.Trimesh(vertices, faces, vertex_colors=(colors * 255).astype(np.uint8), process=False).export(
+        out / "raw_mesh.ply"
+    )
 
     # Decimate so Blender and registration stay light.
     o3d_mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(vertices), o3d.utility.Vector3iVector(faces))
@@ -76,10 +81,21 @@ def main():
     o3d_mesh.remove_degenerate_triangles()
     if len(o3d_mesh.triangles) > args.max_faces:
         o3d_mesh = o3d_mesh.simplify_quadric_decimation(args.max_faces)
-    # Keep the largest connected piece to drop floating fragments.
+    # Keep the largest connected piece to drop floating fragments, ignoring flat sheets that span
+    # the whole generation volume, which TRELLIS sometimes adds under or behind the object.
     clusters, counts, _ = o3d_mesh.cluster_connected_triangles()
-    clusters = np.asarray(clusters)
-    o3d_mesh.remove_triangles_by_mask(clusters != int(np.argmax(counts)))
+    clusters, counts = np.asarray(clusters), np.asarray(counts)
+    tri_vertices = np.asarray(o3d_mesh.vertices)[np.asarray(o3d_mesh.triangles)]
+    candidates = []
+    for c in np.argsort(-counts)[:10]:
+        pts = tri_vertices[clusters == c].reshape(-1, 3)
+        extent = pts.max(0) - pts.min(0)
+        sheet = np.sum(extent > 0.95) >= 2 and extent.min() < 0.05
+        print(f"  piece {c}: {counts[c]} faces, extent {np.round(extent, 3)}{' (volume-spanning sheet)' if sheet else ''}")
+        if not sheet:
+            candidates.append(c)
+    keep = candidates[0] if candidates else int(np.argmax(counts))
+    o3d_mesh.remove_triangles_by_mask(clusters != keep)
     o3d_mesh.remove_unreferenced_vertices()
 
     vertices = np.asarray(o3d_mesh.vertices)
@@ -87,8 +103,6 @@ def main():
     colors_u8 = (np.asarray(o3d_mesh.vertex_colors) * 255).round().astype(np.uint8)
     out_mesh = trimesh.Trimesh(vertices, np.asarray(o3d_mesh.triangles), vertex_colors=colors_u8, process=False)
 
-    out = stages.output_dir("reconstruct") / f"obj_{obj['id']:02d}"
-    out.mkdir(parents=True, exist_ok=True)
     # TRELLIS meshes are Z up, which matches Blender and the register stage.
     out_mesh.export(out / "mesh.ply")
     z_up_to_y_up = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1.0]])

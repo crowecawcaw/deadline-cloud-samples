@@ -66,6 +66,7 @@ def parse_args():
     parser.add_argument("--farm-id")
     parser.add_argument("--queue-id")
     parser.add_argument("--profile")
+    parser.add_argument("--region")
     parser.add_argument("--dry-run", action="store_true", help="Prepare the bundle and print the command only.")
     args = parser.parse_args()
 
@@ -80,7 +81,7 @@ def parse_args():
 
 def deadline_cli(args, *cli_args) -> str:
     cmd = ["deadline", *cli_args]
-    for flag in ("farm_id", "queue_id", "profile"):
+    for flag in ("farm_id", "queue_id", "profile", "region"):
         value = getattr(args, flag)
         if value:
             cmd += [f"--{flag.replace('_', '-')}", value]

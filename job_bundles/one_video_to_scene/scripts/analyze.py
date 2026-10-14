@@ -2,7 +2,7 @@
 
 Outputs (analyze/):
   frames/00000.jpg ...  Sampled frames, longest edge FrameSize
-  objects.json          [{id, label, motion, deformable, bbox, crop_frame, crop}]
+  objects.json          [{id, label, deformable, bbox, crop_frame, crop}]
   masks/obj_NN.npz      Bit-packed boolean masks, shape (frames, height, width)
   depth.npz             Metric depth in meters along the camera axis, float16 (frames, height, width)
   cameras.json          Per-frame intrinsics K (frame pixels) and OpenCV camera-to-world matrices, meters
@@ -207,27 +207,6 @@ def estimate_depth_and_cameras(frame_paths, shape):
     return depth_full, cameras
 
 
-def classify_motion(masks, depth, cameras):
-    """'rigid' when the object's 3D centroid moves more than a quarter of its size, else 'static'."""
-    centroids, sizes = [], []
-    for i, cam in enumerate(cameras):
-        ys, xs = np.nonzero(masks[i] & (depth[i] > 0))
-        if len(xs) < 30:
-            continue
-        K, c2w = np.array(cam["K"]), np.array(cam["cam_to_world"])
-        z = depth[i][ys, xs]
-        pts = np.stack([(xs - K[0, 2]) / K[0, 0] * z, (ys - K[1, 2]) / K[1, 1] * z, z], 1)
-        pts = pts @ c2w[:3, :3].T + c2w[:3, 3]
-        centroids.append(np.median(pts, 0))
-        sizes.append(np.linalg.norm(np.quantile(pts, 0.95, 0) - np.quantile(pts, 0.05, 0)))
-    if len(centroids) < 2:
-        return "static", 0.0
-    centroids = np.array(centroids)
-    travel = float(np.linalg.norm(centroids.max(0) - centroids.min(0)))
-    ratio = travel / max(float(np.median(sizes)), 1e-6)
-    return ("rigid" if ratio > 0.25 else "static"), ratio
-
-
 def best_crop_frame(mask_stack):
     """The frame with the largest mask that doesn't touch the image border."""
     areas = mask_stack.sum((1, 2)).astype(float)
@@ -286,14 +265,13 @@ def main():
     for obj in objects:
         m = masks[obj["id"]]
         np.savez_compressed(out / "masks" / f"obj_{obj['id']:02d}.npz", packed=np.packbits(m, axis=-1), width=W)
-        obj["motion"], ratio = classify_motion(m, depth, cameras)
         if not m.any():
             print(f"WARNING: Object {obj['id']} ({obj['label']}) has an empty mask")
             continue
         obj["crop_frame"] = best_crop_frame(m)
         obj["crop"] = f"crops/obj_{obj['id']:02d}.png"
         save_crop(frame_paths[obj["crop_frame"]], m[obj["crop_frame"]], out / obj["crop"])
-        print(f"Object {obj['id']} {obj['label']}: {obj['motion']} (travel/size {ratio:.2f}), crop frame {obj['crop_frame']}")
+        print(f"Object {obj['id']} {obj['label']}: crop frame {obj['crop_frame']}")
 
     np.savez_compressed(out / "depth.npz", depth=depth.astype(np.float16))
     stages.write_json(out / "cameras.json", {"width": W, "height": H, "fps": fps, "frames": cameras})

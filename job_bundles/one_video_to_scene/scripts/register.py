@@ -82,7 +82,7 @@ def fit_ground(points, cam_centers, object_points):
     R = np.stack([x, y, z])  # rows are the new axes
     G = np.eye(4)
     G[:3, :3] = R
-    G[:3, 3] = R @ (-d * normal)  # the plane point closest to the origin maps to z=0
+    G[:3, 3] = [0.0, 0.0, d]  # new z = normal . p + d, the signed distance to the plane
     ground_points = points[inliers] @ R.T + G[:3, 3]
     return G, ground_points
 
@@ -175,6 +175,17 @@ class SilhouetteCheck:
         return outside / max(total, 1)
 
 
+def classify_motion(per_frame, threshold):
+    """'rigid' when the object's centroid travels more than threshold times its size, else 'static'."""
+    clouds = [p for p in per_frame if len(p) >= 30]
+    if len(clouds) < 2:
+        return "static", 0.0
+    centroids = np.array([np.median(p, axis=0) for p in clouds])
+    size = np.median([np.linalg.norm(np.quantile(p, 0.95, 0) - np.quantile(p, 0.05, 0)) for p in clouds])
+    ratio = float(np.linalg.norm(centroids.max(0) - centroids.min(0)) / max(size, 1e-6))
+    return ("rigid" if ratio > threshold else "static"), ratio
+
+
 def initial_fit(mesh_samples, mesh_tree, observed, view_dir, silhouette=None):
     """Search over yaw angles from an initial guess based on the observed height and position.
 
@@ -216,7 +227,11 @@ def initial_fit(mesh_samples, mesh_tree, observed, view_dir, silhouette=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.parse_args()
+    parser.add_argument(
+        "--motion-threshold", type=float, default=0.5,
+        help="Track an object as moving when its centroid travels more than this times its size.",
+    )
+    args = parser.parse_args()
     rng = np.random.default_rng(0)
 
     analyze = stages.input_dir("analyze")
@@ -261,8 +276,10 @@ def main():
 
         eroded = np.stack([binary_erosion(m, iterations=2) for m in masks[oid]])
         per_frame = [unproject(depth[i], eroded[i], Ks[i], c2w[i], 3000, rng) for i in range(num_frames)]
+        motion, travel = classify_motion(per_frame, args.motion_threshold)
+        print(f"Object {oid} ({obj['label']}): {motion}, travel/size {travel:.2f}")
         key = int(obj.get("crop_frame", int(np.argmax([len(p) for p in per_frame]))))
-        if obj["motion"] == "static":
+        if motion == "static":
             observed = np.concatenate([per_frame[i] for i in sample_frames if len(per_frame[i])])
         else:
             observed = per_frame[key]
@@ -277,12 +294,12 @@ def main():
         view_dir = observed.mean(0) - c2w[key][:3, 3]
         view_dir[2] = 0
         view_dir /= max(np.linalg.norm(view_dir), 1e-9)
-        check_frames = sample_frames if obj["motion"] == "static" else [key]
+        check_frames = sample_frames if motion == "static" else [key]
         silhouette = SilhouetteCheck(masks[oid], depth, Ks, c2w, check_frames)
         s, theta, t, rms, grounded = initial_fit(mesh_samples, mesh_tree, observed, view_dir, silhouette)
         print(f"Object {oid} ({obj['label']}): scale={s:.3f} yaw={np.degrees(theta):.0f} rms={rms:.4f} grounded={grounded}")
 
-        if obj["motion"] == "static":
+        if motion == "static":
             matrices = [to_matrix(s, theta, t)]
         else:
             # Track outward from the key frame in both directions.
@@ -302,7 +319,7 @@ def main():
             {
                 "id": oid,
                 "label": obj["label"],
-                "motion": obj["motion"],
+                "motion": motion,
                 "mesh": f"obj_{oid:02d}/mesh.ply",
                 "matrices": [m.tolist() for m in matrices],
             }
