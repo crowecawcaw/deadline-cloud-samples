@@ -5,8 +5,10 @@
 This job bundle turns a single video into an animated, object-level 3D scene. It finds the
 objects in the video, generates a mesh for each one, places the meshes in 3D, tracks the ones
 that move, and assembles everything in [Blender](https://www.blender.org/) as an animated GLB
-with a ground plane, the recovered camera, and rigid body settings. It also renders the scene
-from the video's camera and encodes a side-by-side comparison with the input.
+with a ground plane, the recovered camera, and rigid body settings. It estimates each object's
+material, mass, and collision shape, and exports simulation-ready USD for
+[Isaac Sim](https://developer.nvidia.com/isaac/sim). It also renders the scene from the video's
+camera and encodes a side-by-side comparison with the input.
 
 The pipeline is inspired by [OVOW (One Video, One World)](https://github.com/yisuanwang/OVOW), but it
 uses only models and libraries under permissive licenses (MIT, Apache-2.0, or BSD). It's a proof of
@@ -17,12 +19,15 @@ concept, not a reproduction: the results are rough, and deformable objects are t
 | Analyze | Samples frames, labels objects with boxes, tracks a mask for each object, estimates depth and camera poses in meters, and saves an RGBA crop of each object | [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), [SAM 2.1](https://github.com/facebookresearch/sam2), [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) `DA3-BASE` and `DA3METRIC-LARGE`, FFmpeg |
 | Reconstruct | Generates a mesh with vertex colors for each object, one task per object | [TRELLIS](https://github.com/microsoft/TRELLIS) `TRELLIS-image-large` |
 | Register | Fits the ground plane, classifies objects as static or moving, fits each mesh to the object's depth points with upright ICP, and tracks moving objects frame to frame | Open3D, SciPy, trimesh |
+| Physics | Asks the vision-language model for each object's material and typical size, computes mass, center of mass, and inertia from the mesh, decomposes it into convex collision parts, and corrects the scene scale | Qwen3-VL, trimesh, [CoACD](https://github.com/SarahWeiii/CoACD) |
 | Assemble | Builds the animated scene and exports `scene.glb` and `scene.blend` | Blender |
+| ExportUSD | Writes a UsdPhysics rigid body asset per object and a `scene.usda` that references them | [OpenUSD](https://openusd.org/) (`usd-core`) |
 | Render | Renders clay and textured passes from the video's camera path, and encodes `compare.mp4` | Blender Cycles, FFmpeg |
 
 ### Licenses of the models
 
-All the model weights the job downloads are MIT or Apache-2.0 licensed. Some popular alternatives
+All the model weights the job downloads are MIT or Apache-2.0 licensed. `usd-core` is under the
+Tomorrow Open Source Technology License, a modified Apache-2.0 license. Some popular alternatives
 were avoided on purpose:
 
 * TRELLIS's own GLB export bakes textures with `nvdiffrast` and a Gaussian rasterizer, which have
@@ -83,7 +88,9 @@ The output directory has one subdirectory per step:
 analyze/      frames/, labels.jpg, objects.json, masks/, depth.npz, cameras.json, crops/
 reconstruct/  obj_NN/mesh.ply, obj_NN/mesh.glb, obj_NN/input.png, obj_NN/raw_mesh.ply
 register/     scene.json, report.json, debug/obj_NN_points.ply
+physics/      scene.json, properties.json, obj_NN/collision.npz
 assemble/     scene.glb, scene.blend
+usd/          scene.usda, objects/obj_NN_<label>.usd
 render/       clay/, textured/, compare.mp4
 ```
 
@@ -108,7 +115,7 @@ Each step reads its inputs from the job's `OutputDir` when an earlier step of th
 them, and from `PriorOutputDir` otherwise. This works for restarts of restarts too: if the previous job
 skipped a stage, `submit.py` takes that stage's outputs from the previous job's `PriorOutputDir`.
 
-The stages are `Analyze`, `Reconstruct`, `Register`, `Assemble`, and `Render`.
+The stages are `Analyze`, `Reconstruct`, `Register`, `Physics`, `Assemble`, `ExportUSD`, and `Render`.
 
 ## How it works
 
@@ -128,6 +135,26 @@ The stages are `Analyze`, `Reconstruct`, `Register`, `Assemble`, and `Render`.
   starting yaws and positions, and a silhouette check against the masks breaks ties. An object whose 3D
   centroid travels more than half its size is "rigid" and gets tracked frame to frame. Static objects use
   points pooled from several frames.
+* **Physical properties.** The vision-language model only classifies each object's crop: its main material
+  from a fixed list, whether it's a thin-walled shell like a mug or a box, and the typical height and mass range
+  of that kind of object. Density, friction, and restitution come from a table of approximate handbook values
+  in [scripts/physics.py](scripts/physics.py). Mass, center of mass, and inertia come from a filled
+  voxelization of the mesh at its registered size, or from a shell of the material's wall thickness for hollow
+  objects. `properties.json` flags masses far outside the model's typical range for review, but
+  doesn't override them, because the model's mass guesses are less reliable than the geometry. CoACD splits each mesh into up to
+  16 convex parts for collision.
+* **Scale correction.** Monocular depth gets the absolute scale only roughly right, and mass grows with the cube
+  of the scale. When objects that come in a narrow range of sizes, like mugs or apples, measure outside their
+  typical height, Physics rescales the whole scene, camera included, by the median correction. Objects whose size
+  varies a lot, like boxes, don't vote, and it takes at least two votes to rescale. Set `ScaleFromSizePriors` to `off` to disable it. `properties.json`
+  records the factor and each object's vote.
+* **USD.** The stage is Z up with meters and kilograms. Each object asset in `usd/objects/` is a rigid body with
+  `UsdPhysics.MassAPI`, a visual mesh with vertex colors (`displayColor`, read by a `UsdPreviewSurface`), convex
+  collision meshes in a `collision` scope with the guide purpose, and a physics material bound with the
+  `physics` purpose. `scene.usda` adds a physics scene with gravity, a ground collider, the video camera, and
+  lights. Objects that stayed put are dynamic bodies at their registered pose, so they react to forces in
+  simulation. Objects that moved are kinematic bodies that replay the tracked motion. Open `usd/scene.usda` in
+  Isaac Sim and press Play.
 
 ## Known limitations
 
@@ -135,4 +162,6 @@ The stages are `Analyze`, `Reconstruct`, `Register`, `Assemble`, and `Render`.
 * Rotationally symmetric shapes, like a mug seen from the side without its handle, can be fitted at the wrong yaw.
 * Moving objects are tracked with yaw and translation only, so a rolling ball slides instead of rolling.
 * Deformable objects are treated as rigid.
+* Physical properties are educated guesses: one material per object, uniform density, and the contents of
+  containers are ignored. Nothing checks that the scene settles stably in simulation.
 * Generative steps are seeded, but results can still vary across GPUs and library versions.

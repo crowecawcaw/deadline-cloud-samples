@@ -3,7 +3,8 @@ name: One Video to Scene
 description: >
   Turn one video into an animated, object-level 3D scene. Labels objects with a vision-language
   model, tracks their masks, estimates depth and camera motion, generates a mesh per object,
-  places and tracks the meshes in 3D, then assembles and renders the scene in Blender.
+  places and tracks the meshes in 3D, estimates each object's material, mass, and collision shape,
+  then assembles the scene in Blender, exports simulation-ready USD for Isaac Sim, and renders it.
   Use submit.py to submit, or to re-run from a later stage reusing a previous job's outputs.
 
 parameterDefinitions:
@@ -107,6 +108,18 @@ parameterDefinitions:
     label: Seed
     groupLabel: Pipeline
   default: 0
+- name: ScaleFromSizePriors
+  description: >
+    Rescale the scene when objects that come in a narrow range of sizes, like mugs or apples,
+    measure outside their typical height. Corrects the absolute scale of monocular depth, which
+    matters for mass.
+  type: STRING
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Scale From Size Priors
+    groupLabel: Pipeline
+  allowedValues: ["on", "off"]
+  default: "on"
 - name: RenderSamples
   description: Cycles samples per pixel for the comparison render.
   type: INT
@@ -249,8 +262,10 @@ steps:
     - name: attr.worker.os.family
       anyOf: [linux]
 
-- name: Assemble
-  description: Build the animated scene in Blender and export it as GLB and .blend.
+- name: Physics
+  description: >
+    Estimate each object's material with the vision-language model, then its mass, center of mass,
+    inertia, and convex collision parts, and correct the scene scale from typical object sizes.
   dependencies:
   - dependsOn: Analyze
   - dependsOn: Reconstruct
@@ -259,7 +274,48 @@ steps:
     actions:
       onRun:
         command: bash
+        args:
+        - "{{Param.JobScriptDir}}/run_stage.sh"
+        - physics
+        - --vlm-model
+        - "{{Param.VlmModel}}"
+        - --scale-from-size-priors
+        - "{{Param.ScaleFromSizePriors}}"
+        timeout: 1800
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
+
+- name: Assemble
+  description: Build the animated scene in Blender and export it as GLB and .blend.
+  dependencies:
+  - dependsOn: Reconstruct
+  - dependsOn: Physics
+  script:
+    actions:
+      onRun:
+        command: bash
         args: ["{{Param.JobScriptDir}}/run_stage.sh", assemble]
+        timeout: 1800
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+
+- name: ExportUSD
+  description: Write a UsdPhysics rigid body asset per object and a scene for Isaac Sim.
+  dependencies:
+  - dependsOn: Reconstruct
+  - dependsOn: Physics
+  script:
+    actions:
+      onRun:
+        command: bash
+        args: ["{{Param.JobScriptDir}}/run_stage.sh", export_usd]
         timeout: 1800
   hostRequirements:
     attributes:

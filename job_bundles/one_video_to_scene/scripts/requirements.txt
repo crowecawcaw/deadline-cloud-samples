@@ -26,6 +26,8 @@ safetensors
 opencv-python
 open3d
 trimesh
+coacd
+usd-core
 scipy
 pillow
 imageio

@@ -35,11 +35,11 @@ from pathlib import Path
 import yaml
 
 BUNDLE_DIR = Path(__file__).resolve().parent
-STAGES = ["Analyze", "Reconstruct", "Register", "Assemble", "Render"]
+STAGES = ["Analyze", "Reconstruct", "Register", "Physics", "Assemble", "ExportUSD", "Render"]
 
 
 def stage_dir_name(stage: str) -> str:
-    return stage.lower()
+    return {"ExportUSD": "usd"}.get(stage, stage.lower())
 
 
 def parse_args():

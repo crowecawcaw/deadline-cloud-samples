@@ -1,6 +1,6 @@
 """Assemble stage (runs inside Blender): build the animated scene and export GLB and .blend.
 
-Reads register/scene.json, where every transform is already in Blender's world frame
+Reads physics/scene.json, where every transform is already in Blender's world frame
 (Z up, meters, ground plane at z=0), and the per-object meshes from the reconstruct stage.
 """
 
@@ -49,7 +49,7 @@ def keyframe_matrices(obj, matrices, start_frame=1):
 
 
 def main():
-    scene_desc = stages.read_json(stages.input_dir("register") / "scene.json")
+    scene_desc = stages.read_json(stages.input_dir("physics") / "scene.json")
     reconstruct_dir = stages.input_dir("reconstruct")
     out = stages.output_dir("assemble")
 
@@ -89,6 +89,12 @@ def main():
         if desc["motion"] != "static":
             obj.rigid_body.kinematic = True
         obj.rigid_body.collision_shape = "CONVEX_HULL"
+        physics = desc.get("physics")
+        if physics:
+            obj.rigid_body.mass = physics["mass_kg"]
+            obj.rigid_body.friction = physics["dynamic_friction"]
+            obj.rigid_body.restitution = physics["restitution"]
+            obj["material"] = physics["material"]
 
     # Camera following the recovered path. Intrinsics come from the first frame.
     cam_desc = scene_desc["camera"]
