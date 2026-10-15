@@ -46,7 +46,8 @@ def free_gpu():
 
 
 def extract_frames(video: Path, num_frames: int, frame_size: int, frames_dir: Path):
-    """Sample num_frames evenly from the video, resized so the longest edge is frame_size."""
+    """Sample num_frames evenly from the video, resized so the longest edge is frame_size. A still
+    image works too, as a video with one frame."""
     probe = json.loads(
         subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
@@ -71,8 +72,9 @@ def extract_frames(video: Path, num_frames: int, frame_size: int, frames_dir: Pa
         for i, path in enumerate(sorted(Path(tmp).glob("*.jpg"))):
             shutil.move(path, frames_dir / f"{i:05d}.jpg")
     frame_paths = sorted(frames_dir.glob("*.jpg"))
-    # Playback rate that keeps the sampled frames at the video's real-time speed.
-    fps = src_fps * (len(frame_paths) - 1) / max(indices[-1] - indices[0], 1)
+    # Playback rate that keeps the sampled frames at the video's real-time speed. A single image
+    # becomes a one-frame scene.
+    fps = src_fps * (len(frame_paths) - 1) / max(indices[-1] - indices[0], 1) if len(frame_paths) > 1 else 24.0
     print(f"Sampled {len(frame_paths)} of {total} frames, effective {fps:.2f} fps")
     return frame_paths, fps, indices
 

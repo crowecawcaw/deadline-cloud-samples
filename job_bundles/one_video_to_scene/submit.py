@@ -35,7 +35,7 @@ from pathlib import Path
 import yaml
 
 BUNDLE_DIR = Path(__file__).resolve().parent
-STAGES = ["Analyze", "Reconstruct", "Register", "Physics", "Assemble", "ExportUSD", "Render"]
+STAGES = ["Analyze", "Reconstruct", "Register", "Physics", "Environment", "Assemble", "ExportUSD", "Render"]
 
 
 def stage_dir_name(stage: str) -> str:

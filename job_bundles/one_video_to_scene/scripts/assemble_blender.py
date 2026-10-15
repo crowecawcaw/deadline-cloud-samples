@@ -96,6 +96,24 @@ def main():
             obj.rigid_body.restitution = physics["restitution"]
             obj["material"] = physics["material"]
 
+    # Environment surfaces: static colliders with vertex colors. They replace the ground plane
+    # visually, which stays as a hidden collider under the floor.
+    try:
+        env_dir = stages.input_dir("environment")
+        surfaces = stages.read_json(env_dir / "environment.json")["surfaces"]
+    except FileNotFoundError:
+        surfaces = []
+    for surface in surfaces:
+        obj = import_mesh(env_dir / surface["mesh"], f"env_{surface['name']}")
+        obj["material"] = surface["material"]
+        bpy.ops.rigidbody.object_add(type="PASSIVE")
+        obj.rigid_body.collision_shape = "MESH"
+        obj.rigid_body.friction = surface["dynamic_friction"]
+        obj.rigid_body.restitution = surface["restitution"]
+    if surfaces:
+        ground.hide_render = True
+        ground.hide_viewport = True
+
     # Camera following the recovered path. Intrinsics come from the first frame.
     cam_desc = scene_desc["camera"]
     bpy.ops.object.camera_add()

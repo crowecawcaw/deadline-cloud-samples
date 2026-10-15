@@ -2,11 +2,12 @@
 
 ## Introduction
 
-This job bundle turns a single video into an animated, object-level 3D scene. It finds the
+This job bundle turns a single video, or a single image, into an animated, object-level 3D scene. It finds the
 objects in the video, generates a mesh for each one, places the meshes in 3D, tracks the ones
 that move, and assembles everything in [Blender](https://www.blender.org/) as an animated GLB
 with a ground plane, the recovered camera, and rigid body settings. It estimates each object's
-material, mass, and collision shape, and exports simulation-ready USD for
+material, mass, and collision shape, reconstructs the surroundings (floor, walls, table tops, and
+everything else the camera saw) as static colliders, and exports simulation-ready USD for
 [Isaac Sim](https://developer.nvidia.com/isaac/sim). It also renders the scene from the video's
 camera and encodes a side-by-side comparison with the input.
 
@@ -20,6 +21,7 @@ concept, not a reproduction: the results are rough, and deformable objects are t
 | Reconstruct | Generates a mesh with vertex colors for each object, one task per object | [TRELLIS](https://github.com/microsoft/TRELLIS) `TRELLIS-image-large` |
 | Register | Fits the ground plane, classifies objects as static or moving, fits each mesh to the object's depth points with upright ICP, and tracks moving objects frame to frame | Open3D, SciPy, trimesh |
 | Physics | Asks the vision-language model for each object's material and typical size, computes mass, center of mass, and inertia from the mesh, decomposes it into convex collision parts, and corrects the scene scale | Qwen3-VL, trimesh, [CoACD](https://github.com/SarahWeiii/CoACD) |
+| Environment | Fits the floor, walls, and table tops, fills them in under the objects, fuses the background depth into a colored mesh, and asks the vision-language model what each surface is made of | Open3D (TSDF fusion), Qwen3-VL |
 | Assemble | Builds the animated scene and exports `scene.glb` and `scene.blend` | Blender |
 | ExportUSD | Writes a UsdPhysics rigid body asset per object and a `scene.usda` that references them | [OpenUSD](https://openusd.org/) (`usd-core`) |
 | Render | Renders clay and textured passes from the video's camera path, and encodes `compare.mp4` | Blender Cycles, FFmpeg |
@@ -55,8 +57,9 @@ Check the licenses yourself before you use this in production.
 
 ## Run the pipeline
 
-You need a video of a few objects. Static camera or slow camera motion works best. Use 1080p or
-higher, and keep the objects reasonably large in frame: each object's crop should be at least about
+You need a video or an image of a few objects. For an image, pass `-p NumFrames=1`; the scene then has a
+single frame and every object is static. For a video, a static camera or slow camera motion works best, and a
+camera that moves around the scene gives a more complete environment. Use 1080p or higher, and keep the objects reasonably large in frame: each object's crop should be at least about
 300 pixels across. TRELLIS turns small or blurry crops into flat, degenerate shapes, and upscaling
 doesn't help. Analyze prints a warning for crops below 300 pixels. To make a synthetic
 test video with no license terms, render [test_data/make_test_video.py](test_data/make_test_video.py) with Blender:
@@ -89,6 +92,7 @@ analyze/      frames/, labels.jpg, objects.json, masks/, depth.npz, cameras.json
 reconstruct/  obj_NN/mesh.ply, obj_NN/mesh.glb, obj_NN/input.png, obj_NN/raw_mesh.ply
 register/     scene.json, report.json, debug/obj_NN_points.ply
 physics/      scene.json, properties.json, obj_NN/collision.npz
+environment/  environment.json, surfaces/<name>.ply, labels.png
 assemble/     scene.glb, scene.blend
 usd/          scene.usda, objects/obj_NN_<label>.usd
 render/       clay/, textured/, compare.mp4
@@ -115,7 +119,7 @@ Each step reads its inputs from the job's `OutputDir` when an earlier step of th
 them, and from `PriorOutputDir` otherwise. This works for restarts of restarts too: if the previous job
 skipped a stage, `submit.py` takes that stage's outputs from the previous job's `PriorOutputDir`.
 
-The stages are `Analyze`, `Reconstruct`, `Register`, `Physics`, `Assemble`, `ExportUSD`, and `Render`.
+The stages are `Analyze`, `Reconstruct`, `Register`, `Physics`, `Environment`, `Assemble`, `ExportUSD`, and `Render`.
 
 ## How it works
 
@@ -148,11 +152,21 @@ The stages are `Analyze`, `Reconstruct`, `Register`, `Physics`, `Assemble`, `Exp
   typical height, Physics rescales the whole scene, camera included, by the median correction. Objects whose size
   varies a lot, like boxes, don't vote, and it takes at least two votes to rescale. Set `ScaleFromSizePriors` to `off` to disable it. `properties.json`
   records the factor and each object's vote.
+* **Environment.** RANSAC finds the major planes among the background points, merges near-duplicates
+  (monocular depth bends large floors), and splits them into connected patches: the lowest large horizontal
+  patch is the floor, other horizontal patches are surfaces like table tops, and vertical ones are walls.
+  Each frame's background depth near a patch snaps onto it, so floors and walls come out flat, and pixels
+  covered by an object take the depth of the patch behind it, which fills in the floor and table top under
+  the objects. Open3D fuses the edited depth into a TSDF volume and extracts a colored mesh, which is split
+  by patch. Everything that isn't on a plane (furniture that wasn't picked as an object, fixtures) stays in
+  an `other` surface. Qwen3-VL sees each surface highlighted in a frame and picks its material, which sets its
+  friction. `labels.png` shows the first frame colored by surface.
 * **USD.** The stage is Z up with meters and kilograms. Each object asset in `usd/objects/` is a rigid body with
   `UsdPhysics.MassAPI`, a visual mesh with vertex colors (`displayColor`, read by a `UsdPreviewSurface`), convex
   collision meshes in a `collision` scope with the guide purpose, and a physics material bound with the
   `physics` purpose. `scene.usda` adds a physics scene with gravity, a ground collider, the video camera, and
-  lights. Objects that stayed put are dynamic bodies at their registered pose, so they react to forces in
+  lights. Environment surfaces are static colliders that use their triangle meshes directly, each with its
+  own physics material, and the ground box stays under them as an invisible collider. Objects that stayed put are dynamic bodies at their registered pose, so they react to forces in
   simulation. Objects that moved are kinematic bodies that replay the tracked motion. Open `usd/scene.usda` in
   Isaac Sim and press Play.
 
@@ -162,6 +176,8 @@ The stages are `Analyze`, `Reconstruct`, `Register`, `Physics`, `Assemble`, `Exp
 * Rotationally symmetric shapes, like a mug seen from the side without its handle, can be fitted at the wrong yaw.
 * Moving objects are tracked with yaw and translation only, so a rolling ball slides instead of rolling.
 * Deformable objects are treated as rigid.
+* The environment only covers surfaces the camera saw. From a single image or a static camera it's a shell
+  seen from one side, and thin structures like chair and table legs come out broken or missing.
 * Physical properties are educated guesses: one material per object, uniform density, and the contents of
   containers are ignored. Nothing checks that the scene settles stably in simulation.
 * Generative steps are seeded, but results can still vary across GPUs and library versions.

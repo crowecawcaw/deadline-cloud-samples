@@ -44,6 +44,11 @@ MATERIALS = {
     "stone":     {"density": 2600, "static_friction": 0.6, "dynamic_friction": 0.5, "restitution": 0.2, "wall": 0.01},
     "fruit":     {"density": 850,  "static_friction": 0.5, "dynamic_friction": 0.4, "restitution": 0.2, "wall": 0.005},
     "food":      {"density": 900,  "static_friction": 0.5, "dynamic_friction": 0.4, "restitution": 0.1, "wall": 0.005},
+    # Mostly for environment surfaces.
+    "plaster":   {"density": 850,  "static_friction": 0.6, "dynamic_friction": 0.5, "restitution": 0.2, "wall": 0.0125},
+    "concrete":  {"density": 2400, "static_friction": 0.7, "dynamic_friction": 0.6, "restitution": 0.2, "wall": 0.05},
+    "tile":      {"density": 2300, "static_friction": 0.5, "dynamic_friction": 0.4, "restitution": 0.3, "wall": 0.01},
+    "carpet":    {"density": 300,  "static_friction": 0.8, "dynamic_friction": 0.7, "restitution": 0.05, "wall": 0.01},
 }
 
 # The format uses placeholders rather than example values, because small models tend to copy examples.

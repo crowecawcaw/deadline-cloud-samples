@@ -24,7 +24,7 @@ utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b1
 huggingface_hub
 safetensors
 opencv-python
-open3d
+open3d==0.18.0  # 0.20 TSDF integration returns empty volumes
 trimesh
 coacd
 usd-core

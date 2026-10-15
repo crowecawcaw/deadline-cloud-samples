@@ -2,6 +2,7 @@
 
 Inputs (reconstruct): obj_NN/mesh.ply
 Inputs (physics):     scene.json, obj_NN/collision.npz
+Inputs (environment): environment.json, surfaces/<name>.ply (optional)
 Outputs (usd):        objects/obj_NN_<label>.usd   One rigid body per file, meters, Z up
                       scene.usda                   Ground, physics scene, camera, lights, and every object
 
@@ -10,6 +11,10 @@ Uses the UsdPhysics schemas that Isaac Sim and other Omniverse apps load directl
   - A visual mesh with vertex colors, and convex collision parts (CollisionAPI with
     MeshCollisionAPI approximation convexHull) in a "collision" scope that isn't rendered
   - A physics material with friction and restitution, bound with the "physics" purpose
+
+Environment surfaces are static colliders that use their triangle mesh directly (approximation
+"none"), each with its own physics material. The ground box stays under them as an invisible
+collider, in case the reconstructed floor has holes.
 
 In the scene, objects that stayed put are dynamic bodies at their registered pose. Objects that
 moved in the video are kinematic bodies that replay the tracked motion as time samples.
@@ -149,6 +154,29 @@ def main():
     UsdPhysics.CollisionAPI.Apply(ground.GetPrim())
     ground_props = {"static_friction": 0.6, "dynamic_friction": 0.5, "restitution": 0.2, "density": 1000}
     bind_physics_material(ground.GetPrim(), physics_material(stage, "/World/Looks/ground_physics", ground_props))
+
+    try:
+        env_dir = stages.input_dir("environment")
+        surfaces = stages.read_json(env_dir / "environment.json")["surfaces"]
+    except FileNotFoundError:
+        surfaces = []
+    if surfaces:
+        UsdGeom.Scope.Define(stage, "/World/Environment")
+        ground.MakeInvisible()
+    for surface in surfaces:
+        env_mesh = trimesh.load(env_dir / surface["mesh"], process=False)
+        name = re.sub(r"[^A-Za-z0-9_]", "_", surface["name"])
+        colors = env_mesh.visual.vertex_colors[:, :3] / 255.0 if env_mesh.visual.kind == "vertex" else None
+        prim = define_mesh(stage, f"/World/Environment/{name}", env_mesh.vertices, env_mesh.faces, colors)
+        UsdShade.MaterialBindingAPI.Apply(prim.GetPrim()).Bind(
+            vertex_color_material(stage, f"/World/Environment/Looks/{name}_visual")
+        )
+        UsdPhysics.CollisionAPI.Apply(prim.GetPrim())
+        UsdPhysics.MeshCollisionAPI.Apply(prim.GetPrim()).CreateApproximationAttr(UsdPhysics.Tokens.none)
+        bind_physics_material(prim.GetPrim(), physics_material(stage, f"/World/Environment/Looks/{name}_physics", surface))
+        for key in ("kind", "identified_as", "material"):
+            prim.GetPrim().SetCustomDataByKey(f"oneVideoToScene:{key}", surface[key])
+        print(f"Environment {name}: {surface['identified_as']} ({surface['material']}), {len(env_mesh.faces)} faces")
 
     UsdGeom.Scope.Define(stage, "/World/Objects")
     for desc in scene_desc["objects"]:

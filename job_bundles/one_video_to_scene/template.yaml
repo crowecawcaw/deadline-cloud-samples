@@ -1,10 +1,10 @@
 specificationVersion: 'jobtemplate-2023-09'
 name: One Video to Scene
 description: >
-  Turn one video into an animated, object-level 3D scene. Labels objects with a vision-language
+  Turn one video or image into an animated, object-level 3D scene. Labels objects with a vision-language
   model, tracks their masks, estimates depth and camera motion, generates a mesh per object,
   places and tracks the meshes in 3D, estimates each object's material, mass, and collision shape,
-  then assembles the scene in Blender, exports simulation-ready USD for Isaac Sim, and renders it.
+  reconstructs the surroundings, then assembles the scene in Blender, exports simulation-ready USD for Isaac Sim, and renders it.
   Use submit.py to submit, or to re-run from a later stage reusing a previous job's outputs.
 
 parameterDefinitions:
@@ -12,7 +12,8 @@ parameterDefinitions:
 # Inputs and outputs
 - name: InputVideo
   description: >
-    The source video. Can be empty when the Analyze step is skipped by a restart from a previous job.
+    The source video, or a single image. Can be empty when the Analyze step is skipped by a restart
+    from a previous job.
   type: PATH
   objectType: FILE
   dataFlow: IN
@@ -23,6 +24,8 @@ parameterDefinitions:
     fileFilters:
     - label: Video files
       patterns: ["*.mp4", "*.mov", "*.mkv", "*.webm"]
+    - label: Image files
+      patterns: ["*.jpg", "*.jpeg", "*.png"]
     - label: All files
       patterns: ["*"]
   default: ""
@@ -52,9 +55,9 @@ parameterDefinitions:
 
 # Pipeline options
 - name: NumFrames
-  description: Number of frames sampled evenly from the video.
+  description: Number of frames sampled evenly from the video. Use 1 for a single image.
   type: INT
-  minValue: 2
+  minValue: 1
   maxValue: 300
   userInterface:
     control: SPIN_BOX
@@ -290,11 +293,37 @@ steps:
     - name: amount.worker.gpu
       min: 1
 
+- name: Environment
+  description: >
+    Reconstruct the static surroundings: fit the floor, walls, and table tops, fill them in under the
+    objects, fuse the background depth into a colored mesh, and estimate each surface's material.
+  dependencies:
+  - dependsOn: Analyze
+  - dependsOn: Physics
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - "{{Param.JobScriptDir}}/run_stage.sh"
+        - environment
+        - --vlm-model
+        - "{{Param.VlmModel}}"
+        timeout: 1800
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: [linux]
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
+
 - name: Assemble
   description: Build the animated scene in Blender and export it as GLB and .blend.
   dependencies:
   - dependsOn: Reconstruct
   - dependsOn: Physics
+  - dependsOn: Environment
   script:
     actions:
       onRun:
@@ -311,6 +340,7 @@ steps:
   dependencies:
   - dependsOn: Reconstruct
   - dependsOn: Physics
+  - dependsOn: Environment
   script:
     actions:
       onRun:

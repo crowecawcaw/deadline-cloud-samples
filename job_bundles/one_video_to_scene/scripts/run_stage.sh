@@ -8,7 +8,7 @@ STAGE=$1
 shift
 
 case "$STAGE" in
-  analyze|register|physics|export_usd)
+  analyze|register|physics|environment|export_usd)
     exec "$ML_PY" "$SCRIPT_DIR/$STAGE.py" "$@"
     ;;
   reconstruct)
