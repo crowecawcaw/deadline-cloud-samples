@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--object-number", type=int, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-faces", type=int, default=60000)
+    parser.add_argument("--attempts", type=int, default=4, help="Seeds to try when the shape looks wrong.")
     args = parser.parse_args()
 
     analyze = stages.input_dir("analyze")
@@ -60,55 +61,75 @@ def main():
 
     print(f"openjd_status: Generating mesh for object {obj['id']}: {obj['label']}")
     image = Image.open(analyze / obj["crop"]).convert("RGBA")
+    alpha = np.asarray(image)[:, :, 3] > 127
+    ys, xs = np.nonzero(alpha)
+    crop_aspect = (np.ptp(ys) + 1) / (np.ptp(xs) + 1)
     pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
     pipeline.cuda()
-    result = pipeline.run(image, seed=args.seed, formats=["mesh"])
-    mesh = result["mesh"][0]
-    vertices = mesh.vertices.detach().cpu().numpy().astype(np.float64)
-    faces = mesh.faces.detach().cpu().numpy()
-    colors = mesh.vertex_attrs[:, :3].clamp(0, 1).detach().cpu().numpy()
-    print(f"TRELLIS mesh: {len(vertices)} vertices, {len(faces)} faces, extent {np.round(np.ptp(vertices, 0), 3)}")
     out = stages.output_dir("reconstruct") / f"obj_{obj['id']:02d}"
     out.mkdir(parents=True, exist_ok=True)
-    trimesh.Trimesh(vertices, faces, vertex_colors=(colors * 255).astype(np.uint8), process=False).export(
-        out / "raw_mesh.ply"
-    )
 
-    # Decimate so Blender and registration stay light.
-    o3d_mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(vertices), o3d.utility.Vector3iVector(faces))
-    o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
-    o3d_mesh.remove_duplicated_vertices()
-    o3d_mesh.remove_degenerate_triangles()
-    if len(o3d_mesh.triangles) > args.max_faces:
-        o3d_mesh = o3d_mesh.simplify_quadric_decimation(args.max_faces)
-    # Keep the largest connected piece to drop floating fragments, ignoring flat sheets that span
-    # the whole generation volume, which TRELLIS sometimes adds under or behind the object.
-    clusters, counts, _ = o3d_mesh.cluster_connected_triangles()
-    clusters, counts = np.asarray(clusters), np.asarray(counts)
-    tri_vertices = np.asarray(o3d_mesh.vertices)[np.asarray(o3d_mesh.triangles)]
-    candidates = []
-    for c in np.argsort(-counts)[:10]:
-        pts = tri_vertices[clusters == c].reshape(-1, 3)
-        extent = pts.max(0) - pts.min(0)
-        sheet = np.sum(extent > 0.95) >= 2 and extent.min() < 0.05
-        print(f"  piece {c}: {counts[c]} faces, extent {np.round(extent, 3)}{' (volume-spanning sheet)' if sheet else ''}")
-        if not sheet:
-            candidates.append(c)
-    keep = candidates[0] if candidates else int(np.argmax(counts))
-    o3d_mesh.remove_triangles_by_mask(clusters != keep)
-    o3d_mesh.remove_unreferenced_vertices()
+    # TRELLIS sometimes returns a flat sheet or a stretched shape, especially for small crops. Try a
+    # few seeds and keep the mesh whose height-to-width ratio best matches the crop's silhouette.
+    best = None
+    for attempt in range(args.attempts):
+        seed = args.seed + attempt
+        mesh = pipeline.run(image, seed=seed, formats=["mesh"])["mesh"][0]
+        vertices = mesh.vertices.detach().cpu().numpy().astype(np.float64)
+        faces = mesh.faces.detach().cpu().numpy()
+        colors = mesh.vertex_attrs[:, :3].clamp(0, 1).detach().cpu().numpy()
+        if attempt == 0:
+            trimesh.Trimesh(vertices, faces, vertex_colors=(colors * 255).astype(np.uint8), process=False).export(
+                out / "raw_mesh.ply"
+            )
+        candidate = clean_mesh(o3d, trimesh, vertices, faces, colors, args.max_faces)
+        extent = np.ptp(candidate.vertices, axis=0)
+        mesh_aspect = extent[2] / max(extent[0], extent[1], 1e-6)
+        mismatch = abs(np.log(max(mesh_aspect, 1e-3) / crop_aspect))
+        print(f"Seed {seed}: extent {np.round(extent, 3)}, height/width {mesh_aspect:.2f} vs crop {crop_aspect:.2f}")
+        if best is None or mismatch < best[0]:
+            best = (mismatch, seed, candidate)
+        if mismatch < np.log(1.3):
+            break
 
-    vertices = np.asarray(o3d_mesh.vertices)
-    vertices -= (vertices.min(0) + vertices.max(0)) / 2
-    colors_u8 = (np.asarray(o3d_mesh.vertex_colors) * 255).round().astype(np.uint8)
-    out_mesh = trimesh.Trimesh(vertices, np.asarray(o3d_mesh.triangles), vertex_colors=colors_u8, process=False)
-
+    mismatch, seed, out_mesh = best
+    if mismatch > np.log(2.0):
+        print(f"openjd_status: No plausible mesh for {obj['label']} after {args.attempts} seeds, skipping it")
+        image.save(out / "input.png")
+        return
     # TRELLIS meshes are Z up, which matches Blender and the register stage.
     out_mesh.export(out / "mesh.ply")
     z_up_to_y_up = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1.0]])
     out_mesh.copy().apply_transform(z_up_to_y_up).export(out / "mesh.glb")
     image.save(out / "input.png")
-    print(f"openjd_status: Wrote mesh for {obj['label']} with {len(out_mesh.faces)} faces")
+    print(f"openjd_status: Wrote mesh for {obj['label']} (seed {seed}) with {len(out_mesh.faces)} faces")
+
+
+def clean_mesh(o3d, trimesh, vertices, faces, colors, max_faces):
+    """Decimate, keep the main connected piece, and center the mesh."""
+    o3d_mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(vertices), o3d.utility.Vector3iVector(faces))
+    o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+    o3d_mesh.remove_duplicated_vertices()
+    o3d_mesh.remove_degenerate_triangles()
+    if len(o3d_mesh.triangles) > max_faces:
+        o3d_mesh = o3d_mesh.simplify_quadric_decimation(max_faces)
+    # Keep the largest connected piece to drop floating fragments, ignoring flat sheets that span
+    # the whole generation volume.
+    clusters, counts, _ = o3d_mesh.cluster_connected_triangles()
+    clusters, counts = np.asarray(clusters), np.asarray(counts)
+    tri_vertices = np.asarray(o3d_mesh.vertices)[np.asarray(o3d_mesh.triangles)]
+    keep = int(np.argmax(counts))
+    for c in np.argsort(-counts)[:10]:
+        extent = np.ptp(tri_vertices[clusters == c].reshape(-1, 3), axis=0)
+        if not (np.sum(extent > 0.95) >= 2 and extent.min() < 0.05):
+            keep = int(c)
+            break
+    o3d_mesh.remove_triangles_by_mask(clusters != keep)
+    o3d_mesh.remove_unreferenced_vertices()
+    vertices = np.asarray(o3d_mesh.vertices)
+    vertices = vertices - (vertices.min(0) + vertices.max(0)) / 2
+    colors_u8 = (np.asarray(o3d_mesh.vertex_colors) * 255).round().astype(np.uint8)
+    return trimesh.Trimesh(vertices, np.asarray(o3d_mesh.triangles), vertex_colors=colors_u8, process=False)
 
 
 if __name__ == "__main__":

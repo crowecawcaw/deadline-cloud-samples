@@ -30,9 +30,10 @@ from PIL import Image, ImageDraw
 import stages
 
 LABEL_PROMPT = (
-    "Locate every distinct physical object in this image that could be picked up or moved, such as "
-    "props, tools, food, toys, vehicles, animals, or people. Skip large surfaces and structure like the "
-    "floor, walls, tables, ceilings, and sky. {hint}"
+    "Locate every distinct object in this image, such as boxes, containers, props, tools, food, toys, "
+    "furniture, vehicles, animals, or people. Include every object resting on a surface, whatever its "
+    "size. Don't include the surfaces and structure themselves, like the floor, walls, the table top, "
+    "ceilings, and sky. {hint}"
     'Report the result in JSON as a list like [{{"bbox_2d": [x1, y1, x2, y2], "label": "short noun", '
     '"deformable": false}}], with one entry per object instance. Set "deformable" to true for objects '
     "that bend or change shape, like cloth, people, and animals."
