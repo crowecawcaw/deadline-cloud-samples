@@ -34,4 +34,5 @@ def read_json(path: Path):
 def write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+        # default= handles numpy scalars and arrays.
+        json.dump(data, f, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))

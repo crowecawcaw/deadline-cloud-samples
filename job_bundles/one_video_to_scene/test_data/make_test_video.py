@@ -109,16 +109,16 @@ def build_scene(frames):
     bpy.context.object.data.materials.append(make_material("Stem", (0.25, 0.15, 0.05), 0.8))
 
     # Rolling ball: the rigid moving object
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.045, location=(-0.5, -0.2, 0.045), segments=48, ring_count=24)
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.045, location=(-0.2, -0.22, 0.045), segments=48, ring_count=24)
     ball = bpy.context.object
     ball.name = "Ball"
     add(ball, make_material("Rubber", (0.1, 0.65, 0.2), 0.45, noise_scale=25))
-    travel = 0.9
-    ball.location = (-0.5, -0.2, 0.045)
+    travel = 0.5
+    ball.location = (-0.2, -0.22, 0.045)
     ball.rotation_euler = (0, 0, 0)
     ball.keyframe_insert("location", frame=1)
     ball.keyframe_insert("rotation_euler", frame=1)
-    ball.location = (-0.5 + travel, -0.15, 0.045)
+    ball.location = (-0.2 + travel, -0.17, 0.045)
     ball.rotation_euler = (0, travel / 0.045, 0)
     ball.keyframe_insert("location", frame=frames)
     ball.keyframe_insert("rotation_euler", frame=frames)
@@ -142,11 +142,11 @@ def build_scene(frames):
     target = bpy.context.object
     bpy.ops.object.camera_add()
     cam = bpy.context.object
-    cam.data.lens = 35
+    cam.data.lens = 40
     track = cam.constraints.new("TRACK_TO")
     track.target = target
     scene.camera = cam
-    radius, height = 1.15, 0.6
+    radius, height = 0.95, 0.5
     for frame in range(1, frames + 1):
         angle = math.radians(-110 + 35 * (frame - 1) / max(frames - 1, 1))
         cam.location = Vector((radius * math.cos(angle), radius * math.sin(angle), height))

@@ -14,9 +14,9 @@ concept, not a reproduction: the results are rough, and deformable objects are t
 
 | Step | What it does | Models and tools |
 |---|---|---|
-| Analyze | Samples frames, labels objects with boxes, tracks a mask for each object, estimates depth and camera poses in meters, classifies objects as static or moving, and saves an RGBA crop of each object | [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), [SAM 2.1](https://github.com/facebookresearch/sam2), [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) `DA3-BASE` and `DA3METRIC-LARGE`, FFmpeg |
+| Analyze | Samples frames, labels objects with boxes, tracks a mask for each object, estimates depth and camera poses in meters, and saves an RGBA crop of each object | [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), [SAM 2.1](https://github.com/facebookresearch/sam2), [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) `DA3-BASE` and `DA3METRIC-LARGE`, FFmpeg |
 | Reconstruct | Generates a mesh with vertex colors for each object, one task per object | [TRELLIS](https://github.com/microsoft/TRELLIS) `TRELLIS-image-large` |
-| Register | Fits the ground plane, then fits each mesh to the object's depth points with upright ICP, and tracks moving objects frame to frame | Open3D, SciPy, trimesh |
+| Register | Fits the ground plane, classifies objects as static or moving, fits each mesh to the object's depth points with upright ICP, and tracks moving objects frame to frame | Open3D, SciPy, trimesh |
 | Assemble | Builds the animated scene and exports `scene.glb` and `scene.blend` | Blender |
 | Render | Renders clay and textured passes from the video's camera path, and encodes `compare.mp4` | Blender Cycles, FFmpeg |
 
@@ -50,12 +50,15 @@ Check the licenses yourself before you use this in production.
 
 ## Run the pipeline
 
-You need a video of a few objects. Static camera or slow camera motion works best. To make a synthetic
+You need a video of a few objects. Static camera or slow camera motion works best. Use 1080p or
+higher, and keep the objects reasonably large in frame: each object's crop should be at least about
+300 pixels across. TRELLIS turns small or blurry crops into flat, degenerate shapes, and upscaling
+doesn't help. Analyze prints a warning for crops below 300 pixels. To make a synthetic
 test video with no license terms, render [test_data/make_test_video.py](test_data/make_test_video.py) with Blender:
 
 ```bash
 blender --background --factory-startup --python test_data/make_test_video.py -- /tmp/tabletop
-ffmpeg -framerate 24 -i /tmp/tabletop/frame_%04d.png -pix_fmt yuv420p tabletop.mp4
+ffmpeg -framerate 24 -i /tmp/tabletop/frame_%04d.png -pix_fmt yuv420p tabletop.mp4  # 1920x1280
 ```
 
 Submit the job with `submit.py`:
@@ -78,7 +81,7 @@ The output directory has one subdirectory per step:
 
 ```
 analyze/      frames/, labels.jpg, objects.json, masks/, depth.npz, cameras.json, crops/
-reconstruct/  obj_NN/mesh.ply, obj_NN/mesh.glb, obj_NN/input.png
+reconstruct/  obj_NN/mesh.ply, obj_NN/mesh.glb, obj_NN/input.png, obj_NN/raw_mesh.ply
 register/     scene.json, report.json, debug/obj_NN_points.ply
 assemble/     scene.glb, scene.blend
 render/       clay/, textured/, compare.mp4
@@ -115,16 +118,16 @@ The stages are `Analyze`, `Reconstruct`, `Register`, `Assemble`, and `Render`.
 * **Tracking.** SAM 2.1 takes the boxes as prompts on the first frame and propagates the masks through the video.
 * **Depth and cameras.** `DA3-BASE` estimates depth, intrinsics, and camera poses for all frames together. Its
   scale is arbitrary, so `DA3METRIC-LARGE` runs on a few frames to find the factor that converts it to meters.
-* **Motion.** An object whose 3D centroid travels more than a quarter of its size is "rigid" and gets tracked.
-  Everything else is "static".
 * **Meshes.** Each object's crop comes from the frame where its mask is largest without touching the image edge.
-  TRELLIS turns the RGBA crop into a mesh. The mesh is decimated to `--max-faces` and reduced to its largest
+  The crop is cut from the source video at its native resolution, with the tracking mask upsampled to soft
+  edges, because TRELLIS needs detail. TRELLIS turns the RGBA crop into a mesh. The mesh is decimated to `--max-faces` and reduced to its largest
   connected piece.
 * **Registration.** The ground plane is the dominant plane among background points near the objects. Objects
   are assumed upright. For an object resting on the ground, its scale comes from its height and its bottom stays
   on the ground, leaving its yaw and position to fit. ICP fits the observed depth points to the mesh from many
-  starting yaws and positions, and a silhouette check against the masks breaks ties. Static objects use points
-  pooled from several frames.
+  starting yaws and positions, and a silhouette check against the masks breaks ties. An object whose 3D
+  centroid travels more than half its size is "rigid" and gets tracked frame to frame. Static objects use
+  points pooled from several frames.
 
 ## Known limitations
 
