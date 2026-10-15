@@ -45,11 +45,14 @@ def unproject(depth, mask, K, cam_to_world, max_points=4000, rng=None):
     return (cam_to_world @ cam.T).T[:, :3]
 
 
-def fit_ground(points, cam_centers, object_points):
+def fit_ground(points, cam_centers, object_points, cam_up, candidates=4):
     """Return a 4x4 transform taking world points to a frame with the ground at z=0, Z up.
 
-    The ground is the dominant plane among background points near the objects, which is the
-    surface they rest on, rather than a distant floor or wall.
+    The ground is a large plane among background points near the objects, which is the surface
+    they rest on rather than a distant floor. Of the few largest planes, it's the one whose
+    normal best matches the cameras' up direction: people hold cameras roughly upright, so a
+    wall or ceiling faces the camera's forward or down direction instead. Without this, a wall
+    that dominates the view becomes the ground.
     """
     if len(object_points):
         center = np.median(object_points, axis=0)
@@ -57,21 +60,37 @@ def fit_ground(points, cam_centers, object_points):
         near = np.linalg.norm(points - center, axis=1) < radius
         if near.sum() > 500:
             points = points[near]
-    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
     # Robust extent, so outliers don't loosen the threshold.
     extent = np.linalg.norm(np.quantile(points, 0.95, axis=0) - np.quantile(points, 0.05, axis=0))
     threshold = 0.005 * extent
-    plane, inliers = pcd.segment_plane(distance_threshold=threshold, ransac_n=3, num_iterations=5000)
-    normal, d = np.array(plane[:3]), plane[3]
-    scale = np.linalg.norm(normal)
-    normal, d = normal / scale, d / scale
+    planes, remaining = [], points
+    for _ in range(candidates):
+        if len(remaining) < 500:
+            break
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(remaining))
+        plane, inliers = pcd.segment_plane(distance_threshold=threshold, ransac_n=3, num_iterations=5000)
+        if planes and len(inliers) < 0.25 * planes[0][2]:
+            break
+        normal = np.array(plane[:3]) / np.linalg.norm(plane[:3])
+        d = plane[3] / np.linalg.norm(plane[:3])
+        # Point the normal toward the cameras so they end up above the ground.
+        if np.mean(cam_centers @ normal + d) < 0:
+            normal, d = -normal, -d
+        planes.append((normal, d, len(inliers)))
+        remaining = np.delete(remaining, inliers, axis=0)
+    # Parallel planes, like a floor and a table top, align equally well; take the largest of
+    # those. RANSAC returns planes largest first.
+    scores = [float(n @ cam_up) for n, _, _ in planes]
+    best = next(i for i, s in enumerate(scores) if s >= max(scores) - 0.1) if max(scores) > 0.3 else 0
+    print("Ground candidates (alignment with camera up, points):",
+          [(round(s, 2), p[2]) for s, p in zip(scores, planes)], "chose", best)
+    normal, d, _ = planes[best]
     # Least-squares refit on the inliers.
     inliers = np.abs(points @ normal + d) < threshold
     centroid = points[inliers].mean(0)
     normal = np.linalg.svd(points[inliers] - centroid, full_matrices=False)[2][2]
     d = -normal @ centroid
     inliers = np.nonzero(np.abs(points @ normal + d) < threshold)[0]
-    # Point the normal toward the cameras so they end up above the ground.
     if np.mean(cam_centers @ normal + d) < 0:
         normal, d = -normal, -d
 
@@ -259,7 +278,10 @@ def main():
         [unproject(depth[i], any_object[i], Ks[i], c2w[i], 5000, rng) for i in sample_frames]
     )
     cam_centers = np.array([m[:3, 3] for m in c2w])
-    G, ground_points = fit_ground(background, cam_centers, object_points)
+    # OpenCV cameras have Y pointing down in the image.
+    cam_up = -np.mean([m[:3, 1] for m in c2w], axis=0)
+    cam_up /= np.linalg.norm(cam_up)
+    G, ground_points = fit_ground(background, cam_centers, object_points, cam_up)
     c2w = [G @ m for m in c2w]
     ground_size = float(2 * np.max(np.abs(ground_points[:, :2])) + 0.5)
 

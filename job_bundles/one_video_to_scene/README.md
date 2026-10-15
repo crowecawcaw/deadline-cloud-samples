@@ -133,7 +133,8 @@ The stages are `Analyze`, `Reconstruct`, `Register`, `Physics`, `Environment`, `
   The crop is cut from the source video at its native resolution, with the tracking mask upsampled to soft
   edges, because TRELLIS needs detail. TRELLIS turns the RGBA crop into a mesh. The mesh is decimated to `--max-faces` and reduced to its largest
   connected piece.
-* **Registration.** The ground plane is the dominant plane among background points near the objects. Objects
+* **Registration.** The ground plane is the largest plane among background points near the objects whose
+  normal matches the camera's up direction, so a wall that fills the view doesn't become the ground. Objects
   are assumed upright. For an object resting on the ground, its scale comes from its height and its bottom stays
   on the ground, leaving its yaw and position to fit. ICP fits the observed depth points to the mesh from many
   starting yaws and positions, and a silhouette check against the masks breaks ties. An object whose 3D
