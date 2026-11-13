@@ -56,15 +56,21 @@ stop holding.
 
 The package declares `__glibc >=2.34`.
 
-### Tested configuration
+### NVIDIA driver
 
-The package was tested on an SMF fleet with an NVIDIA L4 GPU, the `latest` GPU runtime (driver
-595.91), and Amazon Linux 2023.12. It hasn't been tested on the other SMF GPU types.
+Each Isaac Sim release is tested on one NVIDIA driver branch. Isaac Sim 6.1 and 6.2 were tested on
+595.58.03 (R595), see the
+[Isaac Sim 6.2 requirements](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/installation/requirements.html).
+On service-managed fleets, the `latest` GPU accelerator runtime provides R595.
 
-Isaac Sim 5.1, both from this kind of package and from the official NVIDIA container, crashes in
-the RTX renderer (`librtx.scenedb.plugin.so`) on the same workers with driver 595. If you need
-Isaac Sim 5.x, setting the fleet's accelerator `runtime` to `grid:r570` instead of `latest` might
-avoid the crash, but that hasn't been tested.
+The package was tested on an SMF fleet with an NVIDIA L4 GPU, the `latest` runtime (driver
+595.91.07), and Amazon Linux 2023.12. It hasn't been tested on the other SMF GPU types.
+
+Isaac Sim 5.1 was tested only on R580 (580.65.06), and its RTX renderer crashes in
+`librtx.scenedb.plugin.so` on R595, both from a conda package and from NVIDIA's container
+([isaac-sim/IsaacSim#619](https://github.com/isaac-sim/IsaacSim/issues/619)). To run Isaac Sim 5.x,
+set the fleet's accelerator `runtime` to `grid:r580`. That configuration hasn't been tested with
+this recipe.
 
 ## Build the package
 

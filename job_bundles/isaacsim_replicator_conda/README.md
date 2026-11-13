@@ -77,8 +77,8 @@ first render compiles shaders for about 3 minutes.
 
 * **`openjd_fail: failed to load repodata`** when the Conda environment starts: see
   [the conda recipes troubleshooting section](../../conda_recipes/README.md#openjd_fail-failed-to-load-repodata).
-* **Kit crashes in `librtx.scenedb.plugin.so`**: Isaac Sim 5.x does this with the 595 driver on
-  service-managed fleets. Use the Isaac Sim 6.2 package.
+* **Kit crashes in `librtx.scenedb.plugin.so`**: Isaac Sim 5.x does this with the R595 driver that
+  the `latest` GPU runtime provides, because it supports only R580. Use the Isaac Sim 6.2 package.
 * **Errors about `libomniverse_connection.so` or `GLIBC_2.35`** when loading `omniverse://` URLs:
   Nucleus connections aren't supported on glibc 2.34 workers. Use local paths, HTTP(S) URLs, or the
   default asset root.
