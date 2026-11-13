@@ -1,0 +1,134 @@
+specificationVersion: 'jobtemplate-2023-09'
+extensions:
+- TASK_CHUNKING
+name: Isaac Sim Replicator (Conda)
+description: |
+  Generates randomized, annotated synthetic image frames (RGB, 2D bounding boxes, semantic
+  segmentation) with NVIDIA Isaac Sim Replicator on a Linux GPU fleet. Isaac Sim comes from the
+  isaacsim conda package built with conda_recipes/isaacsim-6.2, so workers need no container
+  runtime or host configuration. Frames are split across tasks with CHUNK[INT] task chunking.
+
+  Running this job accepts the NVIDIA Omniverse License Agreement and the NVIDIA Isaac Sim
+  Additional Software and Materials License on the workers.
+
+parameterDefinitions:
+- name: Frames
+  type: STRING
+  description: The frame indexes to generate, for example "0-15".
+  default: "0-15"
+  userInterface:
+    control: LINE_EDIT
+    label: Frames
+    groupLabel: Replicator Settings
+- name: ChunkSize
+  type: INT
+  description: The number of frames each task renders. Larger chunks amortize Isaac Sim startup.
+  default: 8
+  minValue: 1
+  userInterface:
+    control: SPIN_BOX
+    label: Frames Per Task
+    groupLabel: Replicator Settings
+- name: Width
+  type: INT
+  default: 640
+  minValue: 64
+  maxValue: 4096
+  userInterface:
+    control: SPIN_BOX
+    label: Width
+    groupLabel: Replicator Settings
+- name: Height
+  type: INT
+  default: 480
+  minValue: 64
+  maxValue: 4096
+  userInterface:
+    control: SPIN_BOX
+    label: Height
+    groupLabel: Replicator Settings
+- name: Asset
+  type: STRING
+  description: |
+    Optional USD asset to add to the scene. Use a URL, or a path relative to the Isaac Sim asset
+    root such as "Isaac/Props/YCB/Axis_Aligned/003_cracker_box.usd". Leave empty for cubes only.
+  default: "Isaac/Props/YCB/Axis_Aligned/003_cracker_box.usd"
+  userInterface:
+    control: LINE_EDIT
+    label: USD Asset
+    groupLabel: Replicator Settings
+- name: OutputDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: OUT
+  default: output
+  userInterface:
+    control: CHOOSE_DIRECTORY
+    label: Output Directory
+- name: ScriptsDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: IN
+  default: scripts
+  userInterface:
+    control: HIDDEN
+- name: CondaPackages
+  type: STRING
+  description: The Conda packages to install for the job.
+  default: "isaacsim=6.2"
+  userInterface:
+    control: LINE_EDIT
+    label: Conda Packages
+    groupLabel: Software Environment
+- name: CondaChannels
+  type: STRING
+  description: |
+    The Conda channels to install packages from. Put the S3 channel that you built the isaacsim
+    package into first, for example "s3://amzn-s3-demo-bucket/Conda/Default conda-forge".
+  default: "conda-forge"
+  userInterface:
+    control: LINE_EDIT
+    label: Conda Channels
+    groupLabel: Software Environment
+
+jobEnvironments:
+- name: IsaacSimSettings
+  variables:
+    OMNI_KIT_ACCEPT_EULA: "YES"
+    ACCEPT_EULA: "Y"
+    PYTHONUNBUFFERED: "1"
+
+steps:
+- name: Replicator
+  parameterSpace:
+    taskParameterDefinitions:
+    - name: Frame
+      type: CHUNK[INT]
+      range: "{{Param.Frames}}"
+      chunks:
+        defaultTaskCount: "{{Param.ChunkSize}}"
+        rangeConstraint: CONTIGUOUS
+  hostRequirements:
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
+    attributes:
+    - name: attr.worker.os.family
+      anyOf: ["linux"]
+  script:
+    actions:
+      onRun:
+        command: python
+        args:
+        - "{{Param.ScriptsDir}}/run_replicator.py"
+        - "--output-dir"
+        - "{{Param.OutputDir}}"
+        - "--frame-range"
+        - "{{Task.Param.Frame}}"
+        - "--width"
+        - "{{Param.Width}}"
+        - "--height"
+        - "{{Param.Height}}"
+        - "--asset"
+        - "{{Param.Asset}}"
+        timeout: 3600

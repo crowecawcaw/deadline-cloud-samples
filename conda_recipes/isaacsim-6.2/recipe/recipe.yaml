@@ -1,0 +1,73 @@
+# Recipe in rattler-build format.
+# See https://rattler.build/latest/reference/recipe_file/
+#
+# This packages the NVIDIA Isaac Sim pip distribution (https://pypi.nvidia.com) together with
+# its Python dependencies into a single conda package for Deadline Cloud service-managed fleets.
+
+context:
+  version: "6.2.0.0"
+  # Isaac Sim 6.x wheels are built for CPython 3.12 only.
+  python_version: "3.12"
+  pip_extras: "all,extscache"
+
+package:
+  name: isaacsim
+  version: ${{ version }}
+
+build:
+  number: 0
+  skip:
+    - not linux64
+  script:
+    env:
+      PIP_EXTRAS: ${{ pip_extras }}
+    content:
+      - bash "$RECIPE_DIR/build.sh"
+  # The pip-installed binaries are prebuilt by NVIDIA and must not be modified by
+  # rattler-build, other than the targeted symbol version patch applied by build.sh.
+  prefix_detection:
+    ignore_binary_files: true
+  dynamic_linking:
+    binary_relocation: false
+    missing_dso_allowlist:
+      - "**"
+    overlinking_behavior: ignore
+    overdepending_behavior: ignore
+
+requirements:
+  # build.sh runs pip from the build environment with --prefix, so that every pip-installed
+  # distribution is new in the host prefix and included in the package. Only add packages to
+  # host that the pip install doesn't also provide, because rattler-build leaves files that
+  # already exist in the host environment out of the package.
+  build:
+    - python ${{ python_version }}.*
+    - pip
+    - pyelftools
+  host:
+    - python ${{ python_version }}.*
+  run:
+    - python ${{ python_version }}.*
+    # Deadline Cloud service-managed fleet workers run Amazon Linux 2023, which has glibc 2.34.
+    - __glibc >=2.34
+
+tests:
+  - package_contents:
+      site_packages:
+        - isaacsim
+        - torch
+      files:
+        - etc/conda/activate.d/isaacsim-activate.sh
+
+about:
+  homepage: https://developer.nvidia.com/isaac/sim
+  license: LicenseRef-NVIDIA-Isaac-Sim
+  documentation: https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_python.html
+  summary: >
+    NVIDIA Isaac Sim, a robotics simulation application built on NVIDIA Omniverse, packaged from the
+    isaacsim[${{ pip_extras }}] pip distribution for headless use on Deadline Cloud Linux GPU workers.
+  description: >
+    Isaac Sim is distributed under the NVIDIA Isaac Sim Additional Software and Materials License,
+    https://www.nvidia.com/en-us/agreements/enterprise-software/isaac-sim-additional-software-and-materials-license/.
+    Running Isaac Sim requires accepting the NVIDIA Omniverse License Agreement, for example by
+    setting OMNI_KIT_ACCEPT_EULA=YES in the job. Review the license terms before distributing this
+    package outside of your organization.

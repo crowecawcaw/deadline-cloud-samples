@@ -17,7 +17,7 @@ building new packages for either Linux or Windows into it on AWS Deadline Cloud.
 
 ## Recipe index
 
-This table covers all 58 immediate user-selectable recipe directories in `conda_recipes/`.
+This table covers all 59 immediate user-selectable recipe directories in `conda_recipes/`.
 
 | Sample | What it demonstrates | Start here when |
 |---|---|---|
@@ -51,6 +51,7 @@ This table covers all 58 immediate user-selectable recipe directories in `conda_
 | [Redshift for Houdini 2026](houdini-redshift-2026/) | Packaging Redshift for Houdini 2026 | Houdini 21 jobs render with Redshift |
 | [V-Ray 7 for Houdini](houdini-vray-7/) | Packaging V-Ray for Houdini | Houdini jobs render with V-Ray 7 |
 | [Infinigen 1.19.0](infinigen-1.19.0/) | Packaging the procedural scene generator and dependencies | You generate synthetic indoor or outdoor scenes |
+| [Isaac Sim 6.2](isaacsim-6.2/) | Packaging the NVIDIA Isaac Sim pip distribution for glibc 2.34 service-managed fleet workers | Robotics simulation or synthetic data jobs need Isaac Sim |
 | [KeyShot 2025](keyshot-2025/) | Packaging KeyShot 2025.2 for Windows | Your jobs render with KeyShot |
 | [Maya 2025](maya-2025/) | Packaging Maya and configuring module/plugin search paths | Your jobs require Maya 2025 |
 | [Maya 2026](maya-2026/) | Packaging Maya with Plugin Sync activation | Your jobs require Maya 2026 or frequently updated plugins |
